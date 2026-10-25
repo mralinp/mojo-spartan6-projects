@@ -6,10 +6,23 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const SUMP_CLOCK: u32 = 100_000_000; // SUMP dividers are relative to 100 MHz
-/// Rates the hardware hits exactly (they divide the Mojo's 50 MHz clock). Keep in sync with ui/index.html.
-const RATES: [u32; 12] = [
-    50_000_000, 25_000_000, 10_000_000, 5_000_000, 2_000_000, 1_000_000, 500_000, 200_000, 100_000,
-    50_000, 10_000, 1_000,
+/// Rates the hardware hits exactly: they divide the analyzer's 200 MHz clock, and up to 100 MHz also
+/// SUMP's 100 MHz reference. Keep in sync with ui/index.html.
+const RATES: [u32; 14] = [
+    200_000_000,
+    100_000_000,
+    50_000_000,
+    25_000_000,
+    10_000_000,
+    5_000_000,
+    2_000_000,
+    1_000_000,
+    500_000,
+    200_000,
+    100_000,
+    50_000,
+    10_000,
+    1_000,
 ];
 
 type Port = Box<dyn serialport::SerialPort>;
@@ -35,8 +48,16 @@ struct Settings {
 fn setup(s: &Settings) -> Vec<u8> {
     let post = s.post.clamp(4, s.samples);
     let size = (s.samples / 4 - 1) | ((post / 4 - 1) << 16);
+    // Above 100 MHz the divider counts the analyzer's 200 MHz clock instead (SUMP's demux flag).
+    let demux = s.rate > SUMP_CLOCK;
+    let div = if demux {
+        2 * SUMP_CLOCK / s.rate - 1
+    } else {
+        SUMP_CLOCK / s.rate - 1
+    };
     [
-        long(0x80, SUMP_CLOCK / s.rate - 1),
+        long(0x82, demux as u32),
+        long(0x80, div),
         long(0x81, size),
         long(0xC0, s.mask as u32),
         long(0xC1, s.value as u32),
@@ -212,7 +233,7 @@ fn autoset_on(p: &mut Port) -> Result<Setup, String> {
     let mask = 1u8 << ch;
 
     // 2. Shortest pulse: trigger on that line leaving idle, fastest rate first, until a whole pulse fits.
-    for rate in [50_000_000, 5_000_000, 500_000, 50_000, 10_000] {
+    for rate in [200_000_000, 20_000_000, 2_000_000, 200_000, 20_000] {
         let s = Settings {
             rate,
             samples: 4096,
@@ -283,12 +304,18 @@ mod tests {
     fn setup_bytes() {
         // 1 MHz, 16K samples, 4K after the trigger, trigger on D0 high
         let b = setup(&settings(1_000_000, 16384, 4096, 0x01, 0x01));
-        assert_eq!(&b[0..5], &[0x80, 99, 0, 0, 0]);
-        assert_eq!(&b[5..10], &[0x81, 0xFF, 0x0F, 0xFF, 0x03]);
-        assert_eq!(&b[10..20], &[0xC0, 1, 0, 0, 0, 0xC1, 1, 0, 0, 0]);
+        assert_eq!(&b[0..5], &[0x82, 0, 0, 0, 0]); // demux off
+        assert_eq!(&b[5..10], &[0x80, 99, 0, 0, 0]);
+        assert_eq!(&b[10..15], &[0x81, 0xFF, 0x0F, 0xFF, 0x03]);
+        assert_eq!(&b[15..25], &[0xC0, 1, 0, 0, 0, 0xC1, 1, 0, 0, 0]);
+        // 200 MHz: demux on, divider 0 counts the 200 MHz clock; 100 MHz: plain SUMP, divider 0
+        let fast = setup(&settings(200_000_000, 1024, 1024, 0, 0));
+        assert_eq!(&fast[0..10], &[0x82, 1, 0, 0, 0, 0x80, 0, 0, 0, 0]);
+        let hundred = setup(&settings(100_000_000, 1024, 1024, 0, 0));
+        assert_eq!(&hundred[0..10], &[0x82, 0, 0, 0, 0, 0x80, 0, 0, 0, 0]);
         // post is clamped to the 4..=samples range the hardware counts in
         assert_eq!(
-            &setup(&settings(50_000_000, 1024, 0, 0, 0))[5..10],
+            &setup(&settings(50_000_000, 1024, 0, 0, 0))[10..15],
             &[0x81, 0xFF, 0x00, 0x00, 0x00]
         );
     }
@@ -322,7 +349,9 @@ mod tests {
     fn rate_choice() {
         assert_eq!(pick_rate(1.0 / 115_200.0), 2_000_000); // UART bit 8.7 µs -> 10 samples needs 1.15 MHz
         assert_eq!(pick_rate(1e-6), 10_000_000);
-        assert_eq!(pick_rate(10e-9), 50_000_000); // faster than we can sample: best we have
+        assert_eq!(pick_rate(100e-9), 100_000_000);
+        assert_eq!(pick_rate(50e-9), 200_000_000);
+        assert_eq!(pick_rate(10e-9), 200_000_000); // faster than we can sample: best we have
         assert_eq!(pick_rate(1.0), 1_000);
     }
 
@@ -372,5 +401,34 @@ mod tests {
             (8_000.0..9_500.0).contains(&s.pulse_ns),
             "one bit at 115200 is 8.68 µs"
         );
+    }
+
+    /// With the Pro Micro rig on D1. A 16 MHz AVR can't make 115200 exactly: it runs at
+    /// 16 MHz / (8 * 17) = 117647 baud, an 8.50 µs bit. The measured shortest pulse proves the
+    /// real sample rate: 1700 samples at 200 MHz, 850 at 100 MHz.
+    #[test]
+    #[ignore]
+    fn board_rates() {
+        let link = board();
+        for (rate, want) in [(200_000_000, 1700.0), (100_000_000, 850.0)] {
+            let s = Settings {
+                rate,
+                samples: 16384,
+                post: 14748,
+                mask: 2,
+                value: 0,
+                wait_ms: 3000,
+            };
+            let d = link
+                .with(&port(), |p| capture_on(p, &s))
+                .unwrap()
+                .expect("no UART traffic on D1");
+            let run = activity(&d)[1].min_run.expect("no whole bit on D1") as f64;
+            println!(
+                "{} MHz: shortest pulse on D1 = {run} samples (want ~{want})",
+                rate / 1_000_000
+            );
+            assert!((run - want).abs() / want < 0.01);
+        }
     }
 }

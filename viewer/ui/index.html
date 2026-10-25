@@ -123,8 +123,8 @@
 <script>
 // Probe-lead colours, as on Saleae/sigrok harnesses: black, brown, red, orange, yellow, green, blue, violet.
 const COLORS = ['#a3a9b2', '#c08a5c', '#ef4f57', '#f2913f', '#f2cc4c', '#4cb764', '#4c96f7', '#a77ce6'];
-// Every rate divides the Mojo's 50 MHz clock evenly.
-const RATES = [50e6, 25e6, 10e6, 5e6, 2e6, 1e6, 500e3, 200e3, 100e3, 50e3, 10e3, 1e3];
+// Every rate divides the analyzer's 200 MHz clock evenly. Keep in sync with RATES in src-tauri/src/main.rs.
+const RATES = [200e6, 100e6, 50e6, 25e6, 10e6, 5e6, 2e6, 1e6, 500e3, 200e3, 100e3, 50e3, 10e3, 1e3];
 const SIZES = [1024, 2048, 4096, 8192, 16384];
 const PRE = [10, 25, 50, 75, 90];
 const TRIGGER_WAIT_MS = 20000;            // single capture: wait this long for the trigger
