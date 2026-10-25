@@ -94,9 +94,25 @@ The builds aren't code-signed. On macOS, right-click the app and choose **Open**
 cd viewer/src-tauri && cargo run --release
 ```
 
-Pick the port, sample rate, sample count and how much to keep before the trigger, click a channel's chip to trigger
-on it (`X` don't care → `0` → `1`), and press **Capture**. Scroll to zoom, drag to pan, click to drop a marker and
-read the time and frequency to the cursor.
+It works like an oscilloscope:
+
+| Button | Key | What it does |
+|---|---|---|
+| **Auto** | `A` | Finds the busiest line and the level it rests at, measures its shortest pulse, picks the slowest sample rate with 10 samples per pulse, sets a trigger on that line leaving its rest level with 10% kept before it, and captures. |
+| **Run** / **Stop** | `Space` | Captures again and again and redraws in place, keeping your zoom and marker. With a trigger set it waits for each one (Normal mode); without one it free-runs. |
+| **Capture** | `Enter` | One capture (waits up to 20 s for the trigger). |
+
+After every capture the view jumps to where the data begins: the trigger, or the first edge, through the end of
+that first burst. With UART decoding on, that's the first message. `F` zooms out to the whole capture.
+
+To set things by hand, pick the sample rate, sample count and how much to keep before the trigger, and click a
+channel's chip to trigger on it (`X` don't care → `0` → `1`). Scroll to zoom, drag to pan, click to drop a marker
+and read the time and frequency to the cursor.
+
+**Live is repeated captures, not a stream.** Everything goes through the Mojo's AVR at about 17 KB/s, so Run
+refreshes about once a second with 16K samples and about 16 times a second with 1K. The app keeps the serial port
+open while it runs: reopening it on every capture would toggle DTR, and five DTR drops within 250 ms put the Mojo's
+AVR into its loader.
 
 **Sniffing a UART:** wire the two lines to D0 and D1 and the grounds together; both channels decode as 8N1 UART
 by default (toggle with each channel's **UART** chip). The baud rate is detected from the pulse widths, or pick it.
