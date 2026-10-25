@@ -4,8 +4,8 @@ module tb;
     reg clk = 0, host_tx = 1, avr_busy = 0;   // AVR toggles busy per byte received
     reg [7:0] probe = 0;
     wire fpga_tx;
-    always #10 clk = ~clk;                       // 50 MHz
-    always @(posedge clk) probe <= probe + 1;    // counter on the probes
+    always #10 clk = ~clk;                       // 50 MHz crystal (the PLL stub below makes 200 MHz)
+    always @(posedge clk) probe <= probe + 1;    // counter on the probes, stepping at 50 MHz
 
     mojo_top dut (.clk(clk), .rst_n(1'b1), .cclk(1'b1), .avr_tx(host_tx), .avr_rx(fpga_tx),
                   .avr_rx_busy(avr_busy), .probe(probe));
@@ -26,7 +26,7 @@ module tb;
     end endtask
 
     reg [7:0] b, prev;
-    integer i;
+    integer i, repeats;
     initial begin
         #200_000;                                // let cclk detector settle
         send(8'h00);
@@ -60,8 +60,37 @@ module tb;
                 prev = b;
             end
         end join
+        // 200 MHz (demux flag, div 0): every 50 MHz counter value shows up 4 samples in a row.
+        send_long(8'h82, 1);
+        send_long(8'h80, 0);
+        send_long(8'h81, {16'd3, 16'd3});
+        repeats = 0;
+        fork send(8'h01); begin
+            recv(prev);
+            for (i = 1; i < 16; i = i + 1) begin
+                recv(b);
+                if (b != prev && b != prev - 8'd1) $fatal(1, "200 MHz sample %0d = %h after %h", i, b, prev);
+                if (b == prev) repeats = repeats + 1;
+                prev = b;
+            end
+        end join
+        // 15 neighbours at 4 samples per value: 11-12 repeats (100 MHz would give 7-8)
+        if (repeats < 11) $fatal(1, "only %0d repeats: not sampling at 200 MHz", repeats);
         $display("PASS");
         $finish;
     end
     initial begin #20_000_000; $fatal(1, "timeout"); end
 endmodule
+
+// Simulation stand-ins for the Xilinx clocking primitives: 200 MHz out, locked at once.
+module PLL_BASE #(parameter real CLKIN_PERIOD = 20.0, parameter CLKFBOUT_MULT = 16,
+                  parameter CLKOUT0_DIVIDE = 4, parameter COMPENSATION = "INTERNAL") (
+    input CLKIN, CLKFBIN, RST,
+    output CLKFBOUT, CLKOUT1, CLKOUT2, CLKOUT3, CLKOUT4, CLKOUT5,
+    output reg CLKOUT0 = 0,
+    output LOCKED
+);
+    always #2.5 CLKOUT0 = ~CLKOUT0;
+    assign LOCKED = 1;
+endmodule
+module BUFG (input I, output O); assign O = I; endmodule
