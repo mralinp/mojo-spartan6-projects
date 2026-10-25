@@ -144,11 +144,13 @@ On Apple silicon the Arduino AVR compiler is an Intel binary, so it needs Rosett
 1. Pick the **Mojo's** port. The Pro Micro and the dongle show up as serial ports too.
 2. Set 1 MHz and 16K samples, click D0's trigger chip to `0` and set *Before trigger* to 10%.
 3. Press **Capture**. It waits for the next start bit on TXO and shows `tick N\r\n` decoded on D0.
-4. To see the echo, set D1's trigger to `0` (and D0's back to `X`), press Capture, then send a whole line through
-   the dongle. D1 shows your line, and D0 the echo right after it:
+4. To see the echo, set D1's trigger to `0` (and D0's back to `X`) and send a whole line through the dongle.
+   Opening the dongle's port glitches its TX line, which would fire the trigger early, so open it first, then press
+   Capture, then Enter:
    ```bash
-   .venv/bin/python -c "import serial; serial.Serial('/dev/cu.usbserial-XXXX', 115200).write(b'hello mojo\r\n')"
+   .venv/bin/python -c "import serial, time; p = serial.Serial('/dev/cu.usbserial-XXXX', 115200); input('Press Capture in Mojo LA, then Enter here'); p.write(b'hello mojo\r\n'); time.sleep(0.2)"
    ```
+   D1 shows your line, and D0 the echo right after it.
 
 **Capture with PulseView:** pick the driver *Openbench Logic Sniffer & SUMP compatibles*, serial port
 `/dev/cu.usbmodem*`, then *Scan for devices*. It shows up as **Mojo LA** with 8 channels.
