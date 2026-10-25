@@ -15,6 +15,7 @@
     color-scheme: dark;
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }      /* panels set display: grid/flex, which would beat the attribute */
   html, body { height: 100%; margin: 0; }
   body { background: var(--bg); color: var(--fg); font: 13px/1.4 var(--ui); display: grid; grid-template-rows: auto 1fr auto auto; overflow: hidden; }
 
@@ -58,7 +59,22 @@
   .uart[aria-pressed="true"] { color: var(--bg); background: var(--fg); border-color: var(--fg); }
   .plot { position: relative; min-width: 0; }
 
-  #dump { border-top: 1px solid var(--line); background: var(--panel); display: grid; grid-template-rows: auto 1fr; height: 190px; min-height: 0; }
+  #panel { border-top: 1px solid var(--line); background: var(--panel); display: grid; grid-template-rows: auto 1fr; height: 210px; min-height: 0; }
+  .tabs { display: flex; align-items: center; gap: 4px; padding: 4px 10px 0; border-bottom: 1px solid var(--line); }
+  .tabs [role="tab"] { font: 600 10px var(--ui); text-transform: uppercase; letter-spacing: .08em; color: var(--dim);
+    background: none; border: 0; border-bottom: 2px solid transparent; border-radius: 0; padding: 6px 8px; }
+  .tabs [role="tab"][aria-selected="true"] { color: var(--fg); border-bottom-color: var(--accent-hi); }
+  .tabs .scope { margin-left: auto; font-size: 11px; color: var(--dim); display: flex; align-items: center; gap: 6px; }
+  .tabs .scope select { font-size: 11px; padding: 2px 6px; }
+  #dump { display: grid; grid-template-rows: auto 1fr; min-height: 0; }
+  #measure { overflow: auto; min-height: 0; }
+  #measure table { border-collapse: collapse; width: 100%; font: 12px/1.6 var(--mono); font-variant-numeric: tabular-nums; }
+  #measure th { position: sticky; top: 0; background: var(--panel); font: 600 10px var(--ui); text-transform: uppercase;
+    letter-spacing: .06em; color: var(--dim); text-align: right; padding: 6px 14px 4px; border-bottom: 1px solid var(--line); }
+  #measure td { text-align: right; padding: 2px 14px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+  #measure th:first-child, #measure td:first-child { text-align: left; }
+  #measure td.flat { color: var(--dim); text-align: left; }
+  #measure td .sw { display: inline-block; width: 4px; height: 11px; border-radius: 2px; margin-right: 8px; vertical-align: -1px; }
   #dump .bar { display: flex; align-items: center; gap: 16px; padding: 6px 14px; border-bottom: 1px solid var(--line); min-width: 0; }
   #dump h2 { font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); margin: 0; font-weight: 600; }
   #streams { display: flex; gap: 18px; flex: 1; min-width: 0; font: 12px var(--mono); }
@@ -107,26 +123,39 @@
   <div class="plot"><canvas id="cv"></canvas></div>
 </main>
 
-<section id="dump" hidden>
-  <div class="bar">
-    <h2>UART dump</h2>
-    <div id="streams"></div>
-    <span id="warn"></span>
-    <button id="copy">Copy dump</button>
+<section id="panel" hidden>
+  <div class="tabs" role="tablist">
+    <button role="tab" id="tab-measure" aria-selected="true" aria-controls="measure">Measurements</button>
+    <button role="tab" id="tab-dump" aria-selected="false" aria-controls="dump">UART dump</button>
+    <label class="scope" id="scope-wrap">Over <select id="scope"><option value="all">whole capture</option><option value="view">visible window</option></select></label>
   </div>
-  <div id="frames"></div>
+  <div id="measure" role="tabpanel" aria-labelledby="tab-measure">
+    <table>
+      <thead><tr><th>Channel</th><th>Edges</th><th>Frequency</th><th>Period</th><th>Duty</th><th>High min / mean / max</th><th>Low min / mean / max</th></tr></thead>
+      <tbody id="mrows"></tbody>
+    </table>
+  </div>
+  <div id="dump" role="tabpanel" aria-labelledby="tab-dump" hidden>
+    <div class="bar">
+      <div id="streams"></div>
+      <span id="warn"></span>
+      <button id="copy">Copy dump</button>
+    </div>
+    <div id="frames"></div>
+  </div>
 </section>
 
 <footer>
   <span>t <b id="r-time">–</b></span>
   <span>sample <b id="r-idx">–</b></span>
   <span>value <b id="r-val">–</b></span>
-  <span id="r-delta-wrap">Δ <b id="r-delta">click to set a marker</b></span>
+  <span id="r-delta-wrap">Δ <b id="r-delta">click: marker A · shift-click: marker B</b></span>
   <span>view <b id="r-span">–</b></span>
-  <span class="keys"><kbd>scroll</kbd> zoom · <kbd>drag</kbd> pan · <kbd>F</kbd> fit · <kbd>A</kbd> auto · <kbd>Space</kbd> run/stop · <kbd>Enter</kbd> capture · <kbd>Esc</kbd> clear marker</span>
+  <span class="keys"><kbd>scroll</kbd> zoom · <kbd>drag</kbd> pan · <kbd>F</kbd> fit · <kbd>A</kbd> auto · <kbd>Space</kbd> run/stop · <kbd>Enter</kbd> capture · <kbd>Esc</kbd> clear markers</span>
 </footer>
 
 <script src="uart.js"></script>
+<script src="measure.js"></script>
 <script>
 // Probe-lead colours, as on Saleae/sigrok harnesses: black, brown, red, orange, yellow, green, blue, violet.
 const COLORS = ['#a3a9b2', '#c08a5c', '#ef4f57', '#f2913f', '#f2cc4c', '#4cb764', '#4c96f7', '#a77ce6'];
@@ -143,7 +172,8 @@ const cv = $('cv'), ctx = cv.getContext('2d');
 
 let data = null, rate = 1e6, trigIdx = null;
 let view = { start: 0, spp: 1 };          // first visible sample, samples per CSS pixel
-let hoverX = null, marker = null;
+let hoverX = null, marker = null, markerB = null; // A: click, B: shift-click
+let edgesAll = [], edgesBy = [];          // edges on any channel / per channel, for marker snapping
 const trig = Array(8).fill('X');          // per channel: X (don't care), 0, 1
 const trigBtns = [];
 // Header pin behind each channel (see logic_analyzer/mojo.ucf), shown under its name.
@@ -156,7 +186,7 @@ let running = false;                      // live mode
 const uartOn = [true, true, false, false, false, false, false, false];
 let decoded = [];                         // per channel: {baud, frames} or null
 
-const fmtHz = f => f >= 1e6 ? f / 1e6 + ' MHz' : f >= 1e3 ? f / 1e3 + ' kHz' : f + ' Hz';
+const fmtHz = f => { const [d, u] = f >= 1e6 ? [1e6, 'MHz'] : f >= 1e3 ? [1e3, 'kHz'] : [1, 'Hz']; return +(f / d).toPrecision(4) + ' ' + u; };
 function fmtTime(s) {
   const a = Math.abs(s);
   const [d, u] = a === 0 ? [1, 's'] : a < 1e-6 ? [1e-9, 'ns'] : a < 1e-3 ? [1e-6, 'µs'] : a < 1 ? [1e-3, 'ms'] : [1, 's'];
@@ -192,7 +222,7 @@ for (let ch = 0; ch < 8; ch++) {
     const finish = keep => {
       if (done) return; done = true;
       if (keep) { names[ch] = input.value.trim(); saveNames(); }
-      input.replaceWith(nm); showName(); renderDump(); nm.focus();
+      input.replaceWith(nm); showName(); renderDump(); renderMeasure(true); nm.focus();
     };
     // preventDefault: otherwise this Enter also clicks the name button that gets focus back, reopening the editor
     input.onkeydown = e => {
@@ -303,10 +333,57 @@ async function auto() {
 
 function show(d, r, t, keepView = false) {
   data = d; rate = r; trigIdx = t;
-  if (!keepView) marker = null;
+  if (!keepView) marker = markerB = null;
+  edgesAll = []; edgesBy = [[], [], [], [], [], [], [], []];
+  for (let i = 1; i < d.length; i++) {
+    const x = d[i] ^ d[i - 1];
+    if (!x) continue;
+    edgesAll.push(i);
+    for (let ch = 0; ch < 8; ch++) if (x >> ch & 1) edgesBy[ch].push(i);
+  }
+  $('panel').hidden = false;
   decode();
+  renderMeasure(true);
   if (keepView) { clampView(); draw(); } else autoView();
 }
+
+// ---- measurements ----
+let measuredFor = '';
+function renderMeasure(force = false) {
+  if (!data) return;
+  const whole = $('scope').value === 'all';
+  const i0 = whole ? 0 : Math.max(0, Math.floor(iAt(0))), i1 = whole ? data.length : Math.min(data.length, Math.ceil(iAt(W())));
+  const key = `${i0}:${i1}`;
+  if (!force && key === measuredFor) return;     // draw() runs on every mouse move; only redo when the window changes
+  measuredFor = key;
+  const t = n => fmtTime(n / rate);
+  const tbody = $('mrows');
+  tbody.innerHTML = '';
+  for (let ch = 0; ch < 8; ch++) {
+    const m = measure(data, ch, i0, i1), tr = document.createElement('tr');
+    const cells = m.level !== null
+      ? [`<td class="flat" colspan="6">flat ${m.level ? 'high' : 'low'}</td>`]
+      : [`<td>${m.edges}</td>`,
+         `<td>${m.period ? fmtHz(rate / m.period.mean) : '–'}</td>`,
+         `<td title="${m.period ? `min ${t(m.period.min)}, max ${t(m.period.max)}, ${m.period.n} periods` : ''}">${m.period ? t(m.period.mean) : '–'}</td>`,
+         `<td>${m.duty !== null ? (m.duty * 100).toFixed(1) + '%' : '–'}</td>`,
+         `<td>${m.high ? `${t(m.high.min)} / ${t(m.high.mean)} / ${t(m.high.max)}` : '–'}</td>`,
+         `<td>${m.low ? `${t(m.low.min)} / ${t(m.low.mean)} / ${t(m.low.max)}` : '–'}</td>`];
+    tr.innerHTML = `<td><span class="sw" style="background:${COLORS[ch]}"></span><span class="n"></span></td>` + cells.join('');
+    tr.querySelector('.n').textContent = label(ch); // names are user text
+    tbody.append(tr);
+  }
+}
+function selectTab(which) {
+  for (const [tab, panel] of [['tab-measure', 'measure'], ['tab-dump', 'dump']]) {
+    const on = panel === which;
+    $(tab).setAttribute('aria-selected', on); $(panel).hidden = !on;
+  }
+  $('scope-wrap').hidden = which !== 'measure';
+}
+$('tab-measure').onclick = () => selectTab('measure');
+$('tab-dump').onclick = () => selectTab('dump');
+$('scope').onchange = () => renderMeasure(true);
 
 // ---- UART ----
 const esc = b => b === 10 ? '\\n' : b === 13 ? '\\r' : b === 9 ? '\\t' : b >= 32 && b < 127 ? String.fromCharCode(b) : '·';
@@ -326,10 +403,12 @@ function allFrames() {
 }
 
 function renderDump() {
-  const on = decoded.some(Boolean);
-  $('dump').hidden = !on;
-  if (!on) return;
   $('streams').innerHTML = '';
+  if (!decoded.some(Boolean)) {
+    $('warn').textContent = '';
+    $('frames').innerHTML = '<div class="empty">Turn on a channel\'s UART chip to decode it.</div>';
+    return;
+  }
   const slow = [];
   decoded.forEach((d, ch) => {
     if (!d) return;
@@ -500,9 +579,11 @@ function draw() {
     ctx.fillStyle = C('--accent-hi'); ctx.beginPath(); ctx.moveTo(x - 6, ruler - 10); ctx.lineTo(x + 6, ruler - 10); ctx.lineTo(x, ruler - 1); ctx.fill();
   }
   if (marker !== null) vline(xOf(marker), '#e8e8e8', [4, 3]);
+  if (markerB !== null) vline(xOf(markerB), '#f2cc4c', [4, 3]);
   if (hoverX !== null) vline(hoverX, '#ffffff55', []);
 
   readout();
+  if ($('scope').value === 'view') renderMeasure();
 }
 
 function readout() {
@@ -513,10 +594,11 @@ function readout() {
   $('r-time').textContent = fmtTime((i - t0()) / rate);
   $('r-idx').textContent = i;
   $('r-val').textContent = '0x' + v.toString(16).padStart(2, '0').toUpperCase() + '  ' + v.toString(2).padStart(8, '0');
-  if (marker !== null) {
-    const dt = Math.abs(i - marker) / rate;
-    $('r-delta').textContent = dt ? `${fmtTime(dt)}  (${fmtHz(+(1 / dt).toPrecision(4))})` : '0';
-  }
+  if (marker !== null && markerB === null) showDelta('A→cursor', i - marker);
+}
+function showDelta(what, samples) {
+  const dt = Math.abs(samples) / rate;
+  $('r-delta').textContent = `${what} ` + (dt ? `${fmtTime(dt)}  (${fmtHz(1 / dt)})` : '0');
 }
 
 // ---- interaction ----
@@ -538,7 +620,15 @@ cv.addEventListener('pointermove', e => {
   draw();
 });
 cv.addEventListener('pointerup', e => {
-  if (drag && !drag.moved && data) { marker = Math.round(iAt(e.offsetX)); }
+  if (drag && !drag.moved && data) {
+    // snap to an edge on the row clicked (any channel's, on the time ruler)
+    const ruler = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--ruler'));
+    const row = Math.floor((e.offsetY - ruler) / ((H() - ruler) / 8));
+    const at = Math.round(iAt(e.offsetX));
+    const snapped = nearestEdge(row >= 0 && row < 8 ? edgesBy[row] : edgesAll, at, 6 * view.spp) ?? at;
+    if (e.shiftKey) markerB = snapped; else marker = snapped;
+    if (marker !== null && markerB !== null) showDelta('A→B', markerB - marker);
+  }
   drag = null; cv.classList.remove('dragging'); draw();
 });
 cv.addEventListener('pointerleave', () => { hoverX = null; draw(); });
@@ -548,7 +638,7 @@ addEventListener('keydown', e => {
   else if (e.key === 'Enter' && !$('capture').disabled) capture();
   else if (e.key === ' ' && !$('run').disabled) { e.preventDefault(); run(); }
   else if ((e.key === 'a' || e.key === 'A') && !$('auto').disabled) auto();
-  else if (e.key === 'Escape') { marker = null; $('r-delta').textContent = 'click to set a marker'; draw(); }
+  else if (e.key === 'Escape') { marker = markerB = null; $('r-delta').textContent = 'click: marker A · shift-click: marker B'; draw(); }
 });
 $('capture').onclick = () => capture();
 $('run').onclick = run;
