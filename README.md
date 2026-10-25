@@ -29,7 +29,7 @@
 
 | Project | What it does | Resources |
 |---|---|---|
-| [**logic_analyzer**](logic_analyzer/) | 8-channel, 50 MHz, 16K-sample logic analyzer. Speaks the SUMP protocol, so PulseView / sigrok is the UI. | 7% slices, 8 of 32 BRAMs |
+| [**logic_analyzer**](logic_analyzer/) | 8-channel, 200 MHz, 16K-sample logic analyzer. Speaks the SUMP protocol, so PulseView / sigrok work too. | 17% slices, 8 of 32 BRAMs, 1 PLL |
 | [**viewer**](viewer/) | **Mojo LA**, a desktop app (Tauri + Rust) that captures from the logic analyzer, draws the waveforms and decodes UART. | macOS, Windows, Linux |
 | [**led_counter**](led_counter/) | 8-bit binary counter on the onboard LEDs. The "hello world" that proves the toolchain works. | 1% slices |
 
@@ -63,7 +63,7 @@ The builds aren't code-signed. On macOS, right-click the app and choose **Open**
 | | |
 |---|---|
 | Channels | 8 |
-| Max sample rate | 50 MHz |
+| Max sample rate | 200 MHz (5 ns), from the Spartan-6 PLL; 100 MHz in PulseView |
 | Memory | 16,384 samples |
 | Trigger | pattern match (mask + value), pre/post-trigger split; holds off until the pre-trigger part is fresh |
 | Protocol | SUMP / Openbench Logic Sniffer |
@@ -214,6 +214,11 @@ Two quirks that cost real debugging time, written down so they don't cost it aga
 - **Large USB writes wedge the AVR on modern macOS.** The bootloader acknowledges the command and size, then
   stops reading mid-transfer until the board is power-cycled. Writing the bitstream in 32-byte pieces fixes it, so
   `mojo_load.py` does exactly that.
+- **200 MHz needs every path under 5 ns.** The PLL turns the 50 MHz crystal into 200 MHz for the whole design.
+  The first build missed by 120 ps, so four slow paths are now registered: the trigger compare, the
+  configuration-done flag, the sample counter's end check and the sample tick, each predicted a cycle ahead. The
+  worst path is now 4.63 ns. A Pro Micro's UART bit measures 1,700 samples at 200 MHz: its real baud rate is
+  117,647, as close to 115,200 as a 16 MHz AVR gets.
 - **`avr_rx_busy` is a toggle, not a level.** The AVR firmware flips the line once per byte it has room for and
   freezes it when its buffer is nearly full. Treating it as a level deadlocks the FPGA; ignoring it drops a third of
   a 16K capture. The analyzer sends one byte per edge, and a full 16K capture now arrives intact in about a second.
