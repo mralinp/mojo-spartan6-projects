@@ -142,6 +142,12 @@ CS (optional). Bytes are boxed on the SDA / MOSI / MISO rows and listed with UAR
 all 8 channels at once, so UART, I²C and SPI can be decoded side by side; set the rate for the fastest bus. Buses
 are remembered. Decoder tests: `node viewer/ui/buses.test.js`.
 
+**Keep and share captures.** **Save** (⌘S) writes a `.mojola` file: the samples plus everything needed to
+reopen it exactly as it was, including the sample rate, trigger point, time taken, channel names, UART chips and
+I²C/SPI buses. **Open** (⌘O) brings it back. **Export** writes **VCD** (opens in GTKWave and PulseView, wires
+named after your channels, 1 ns timescale) or **CSV** (time from the trigger in seconds, then one 0/1 column per
+channel). Tests: `node viewer/ui/files.test.js`.
+
 `npx @tauri-apps/cli@2 build` in `viewer/src-tauri` makes a `.app` and `.dmg`. Opening `viewer/ui/index.html` in a
 browser shows the viewer with demo data: AT commands on UART, an SSD1306 and a TMP102 on I²C, and a flash ID read
 on SPI.
