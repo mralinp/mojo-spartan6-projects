@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mojo LA</title>
+<style>
+  /* Instrument panel: dark bench, probe-lead colours carry the channels, one red action. */
+  :root {
+    --bg: #111317; --panel: #17191e; --line: #262a31; --grid: #1d2026;
+    --fg: #d8dbe0; --dim: #7d838d; --accent: #d4202c; --accent-hi: #ec3a45;
+    --ui: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --ruler: 30px; --gutter: 96px;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--fg); font: 13px/1.4 var(--ui); display: grid; grid-template-rows: auto 1fr auto; overflow: hidden; }
+
+  header { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; padding: 10px 14px; background: var(--panel); border-bottom: 1px solid var(--line); }
+  .brand { display: flex; align-items: center; gap: 8px; font-weight: 600; letter-spacing: .02em; margin-right: 6px; }
+  .brand svg { width: 22px; height: 22px; }
+  label.field { display: flex; flex-direction: column; gap: 2px; font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); }
+  select, button { font: 13px var(--ui); color: var(--fg); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+  select:focus-visible, button:focus-visible { outline: 2px solid var(--accent-hi); outline-offset: 1px; }
+  .port { display: flex; gap: 4px; }
+  .port select { min-width: 210px; }
+  button { cursor: pointer; }
+  button.icon { padding: 5px 8px; }
+  #capture { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; padding: 8px 18px; margin-left: 4px; }
+  #capture:hover { background: var(--accent-hi); }
+  #capture:disabled { opacity: .55; cursor: progress; }
+  #status { margin-left: auto; color: var(--dim); max-width: 46ch; text-align: right; }
+  #status.err { color: #ff8a8f; }
+
+  main { display: grid; grid-template-columns: var(--gutter) 1fr; min-height: 0; }
+  .gutter { display: flex; flex-direction: column; border-right: 1px solid var(--line); background: var(--panel); }
+  .gutter .spacer { height: var(--ruler); border-bottom: 1px solid var(--line); font-size: 10px; color: var(--dim); text-transform: uppercase; letter-spacing: .08em; display: flex; align-items: end; justify-content: flex-end; padding: 0 10px 5px; }
+  .ch { flex: 1; display: flex; align-items: center; gap: 8px; padding: 0 10px; border-bottom: 1px solid var(--grid); }
+  .ch .swatch { width: 4px; align-self: stretch; margin: 10px 0; border-radius: 2px; }
+  .ch .name { font: 600 12px var(--mono); flex: 1; }
+  .trig { font: 600 11px var(--mono); width: 26px; padding: 3px 0; text-align: center; border-radius: 4px; color: var(--dim); }
+  .trig[data-v="0"], .trig[data-v="1"] { color: #fff; border-color: var(--accent); background: color-mix(in srgb, var(--accent) 35%, transparent); }
+  .plot { position: relative; min-width: 0; }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; cursor: crosshair; }
+  canvas.dragging { cursor: grabbing; }
+
+  footer { display: flex; gap: 22px; flex-wrap: wrap; padding: 7px 14px; background: var(--panel); border-top: 1px solid var(--line); font: 12px var(--mono); color: var(--dim); font-variant-numeric: tabular-nums; }
+  footer b { color: var(--fg); font-weight: 500; }
+  footer .keys { margin-left: auto; font-family: var(--ui); }
+  kbd { font: 11px var(--mono); border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <svg viewBox="0 0 256 256" aria-hidden="true"><g fill="#D4202C"><rect x="76" y="14" width="16" height="26"/><rect x="76" y="216" width="16" height="26"/><rect x="14" y="76" width="26" height="16"/><rect x="216" y="76" width="26" height="16"/><rect x="120" y="14" width="16" height="26"/><rect x="120" y="216" width="16" height="26"/><rect x="14" y="120" width="26" height="16"/><rect x="216" y="120" width="26" height="16"/><rect x="164" y="14" width="16" height="26"/><rect x="164" y="216" width="16" height="26"/><rect x="14" y="164" width="26" height="16"/><rect x="216" y="164" width="26" height="16"/><path fill-rule="evenodd" d="M54 40H202A14 14 0 0 1 216 54V202A14 14 0 0 1 202 216H54A14 14 0 0 1 40 202V54A14 14 0 0 1 54 40Z M54 167 L65 167 L65 71 L119 71 L119 131 L137 131 L137 71 L191 71 L191 167 L202 167 L202 185 L173 185 L173 89 L155 89 L155 149 L101 149 L101 89 L83 89 L83 185 L54 185Z"/></g></svg>
+    Mojo LA
+  </div>
+  <label class="field">Port
+    <span class="port"><select id="port"></select><button class="icon" id="refresh" title="Rescan serial ports" aria-label="Rescan serial ports">↻</button></span>
+  </label>
+  <label class="field">Sample rate <select id="rate"></select></label>
+  <label class="field">Samples <select id="samples"></select></label>
+  <label class="field">Before trigger <select id="pre"></select></label>
+  <button id="capture">Capture</button>
+  <div id="status"></div>
+</header>
+
+<main>
+  <div class="gutter" id="gutter"><div class="spacer">Trigger</div></div>
+  <div class="plot"><canvas id="cv"></canvas></div>
+</main>
+
+<footer>
+  <span>t <b id="r-time">–</b></span>
+  <span>sample <b id="r-idx">–</b></span>
+  <span>value <b id="r-val">–</b></span>
+  <span id="r-delta-wrap">Δ <b id="r-delta">click to set a marker</b></span>
+  <span>view <b id="r-span">–</b></span>
+  <span class="keys"><kbd>scroll</kbd> zoom · <kbd>drag</kbd> pan · <kbd>F</kbd> fit · <kbd>Enter</kbd> capture · <kbd>Esc</kbd> clear marker</span>
+</footer>
+
+<script>
+// Probe-lead colours, as on Saleae/sigrok harnesses: black, brown, red, orange, yellow, green, blue, violet.
+const COLORS = ['#a3a9b2', '#c08a5c', '#ef4f57', '#f2913f', '#f2cc4c', '#4cb764', '#4c96f7', '#a77ce6'];
+// Every rate divides the Mojo's 50 MHz clock evenly.
+const RATES = [50e6, 25e6, 10e6, 5e6, 2e6, 1e6, 500e3, 200e3, 100e3, 50e3, 10e3, 1e3];
+const SIZES = [1024, 2048, 4096, 8192, 16384];
+const PRE = [10, 25, 50, 75, 90];
+const TRIGGER_WAIT_S = 20;
+
+const tauri = window.__TAURI__;
+const $ = id => document.getElementById(id);
+const cv = $('cv'), ctx = cv.getContext('2d');
+
+let data = null, rate = 1e6, trigIdx = null;
+let view = { start: 0, spp: 1 };          // first visible sample, samples per CSS pixel
+let hoverX = null, marker = null;
+const trig = Array(8).fill('X');          // per channel: X (don't care), 0, 1
+
+const fmtHz = f => f >= 1e6 ? f / 1e6 + ' MHz' : f >= 1e3 ? f / 1e3 + ' kHz' : f + ' Hz';
+function fmtTime(s) {
+  const a = Math.abs(s);
+  const [d, u] = a === 0 ? [1, 's'] : a < 1e-6 ? [1e-9, 'ns'] : a < 1e-3 ? [1e-6, 'µs'] : a < 1 ? [1e-3, 'ms'] : [1, 's'];
+  return +(s / d).toPrecision(4) + ' ' + u;
+}
+const fill = (sel, items, fmt, def) => { for (const v of items) sel.add(new Option(fmt(v), v, false, v === def)); };
+fill($('rate'), RATES, fmtHz, 1e6);
+fill($('samples'), SIZES, n => n / 1024 + 'K', 16384);
+fill($('pre'), PRE, p => p + '%', 25);
+
+// Channel gutter with trigger chips
+for (let ch = 0; ch < 8; ch++) {
+  const row = document.createElement('div');
+  row.className = 'ch';
+  row.innerHTML = `<span class="swatch" style="background:${COLORS[ch]}"></span><span class="name">D${ch}</span>
+    <button class="trig" data-v="X" title="Trigger on D${ch}: don't care, low or high">X</button>`;
+  const b = row.querySelector('button');
+  b.onclick = () => { trig[ch] = { X: '0', 0: '1', 1: 'X' }[trig[ch]]; b.dataset.v = b.textContent = trig[ch]; };
+  $('gutter').append(row);
+}
+
+function status(msg, err = false) { $('status').textContent = msg; $('status').className = err ? 'err' : ''; }
+
+async function refreshPorts() {
+  if (!tauri) return;
+  const sel = $('port'), keep = sel.value;
+  sel.innerHTML = '';
+  const ports = await tauri.core.invoke('list_ports');
+  for (const p of ports) sel.add(new Option(p.replace('/dev/cu.', ''), p, false, p === keep));
+  if (!ports.length) sel.add(new Option('No serial ports found', ''));
+}
+
+async function capture() {
+  if (!tauri) return status('Captures need the Mojo LA app; this is demo data.', true);
+  const port = $('port').value;
+  if (!port) return status('Plug in the Mojo, then press ↻ to find its port.', true);
+  const samples = +$('samples').value, r = +$('rate').value;
+  let mask = 0, value = 0;
+  trig.forEach((t, ch) => { if (t !== 'X') { mask |= 1 << ch; if (t === '1') value |= 1 << ch; } });
+  // With no trigger, keep every sample after arming so none are stale.
+  const post = mask ? Math.max(4, Math.round(samples * (100 - +$('pre').value) / 400) * 4) : samples;
+  $('capture').disabled = true;
+  status(mask ? 'Waiting for trigger…' : 'Capturing…');
+  try {
+    const bytes = await tauri.core.invoke('capture', { port, rate: r, samples, post, mask, value, waitS: TRIGGER_WAIT_S });
+    show(Uint8Array.from(bytes), r, mask ? samples - 1 - post : null);
+    status(`${samples.toLocaleString()} samples at ${fmtHz(r)} · ${fmtTime(samples / r)}`);
+  } catch (e) {
+    status(String(e), true);
+  } finally {
+    $('capture').disabled = false;
+  }
+}
+
+function show(d, r, t) { data = d; rate = r; trigIdx = t; marker = null; fit(); }
+
+// ---- view ----
+const W = () => cv.clientWidth, H = () => cv.clientHeight;
+function fit() { if (data) { view.spp = data.length / W(); view.start = 0; } draw(); }
+function clampView() {
+  if (!data) return;
+  view.spp = Math.min(Math.max(view.spp, 1 / 60), data.length / W());
+  view.start = Math.min(Math.max(view.start, 0), data.length - W() * view.spp);
+}
+const xOf = i => (i - view.start) / view.spp;
+const iAt = x => view.start + x * view.spp;
+const t0 = () => trigIdx ?? 0;
+
+function niceStep(raw) {
+  const p = 10 ** Math.floor(Math.log10(raw));
+  return [1, 2, 5, 10].map(m => m * p).find(s => s >= raw);
+}
+
+function draw() {
+  const dpr = devicePixelRatio || 1, w = W(), h = H();
+  if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) { cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr); }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  const css = getComputedStyle(document.documentElement);
+  const ruler = parseFloat(css.getPropertyValue('--ruler')), rowH = (h - ruler) / 8;
+  const C = n => css.getPropertyValue(n).trim();
+
+  // rows
+  ctx.fillStyle = C('--grid');
+  for (let ch = 1; ch <= 8; ch++) ctx.fillRect(0, ruler + ch * rowH - 1, w, 1);
+
+  if (!data) {
+    ctx.fillStyle = C('--dim'); ctx.font = '14px ' + C('--ui'); ctx.textAlign = 'center';
+    ctx.fillText('Pick the Mojo’s port and press Capture.', w / 2, ruler + (h - ruler) / 2);
+    ctx.textAlign = 'left';
+    return;
+  }
+
+  // time ruler: ticks every 1/2/5 × 10^k seconds, zero at the trigger
+  const step = niceStep(110 * view.spp / rate);
+  const first = Math.ceil((iAt(0) - t0()) / rate / step) * step;
+  ctx.font = '11px ' + C('--mono'); ctx.textBaseline = 'middle';
+  for (let t = first; ; t += step) {
+    const x = xOf(t * rate + t0());
+    if (x > w) break;
+    ctx.fillStyle = C('--grid'); ctx.fillRect(Math.round(x), ruler, 1, h - ruler);
+    ctx.fillStyle = C('--line'); ctx.fillRect(Math.round(x), ruler - 7, 1, 7);
+    ctx.fillStyle = C('--dim'); ctx.fillText(fmtTime(Math.abs(t) < step / 1e6 ? 0 : t), x + 4, ruler / 2);
+  }
+  ctx.fillStyle = C('--line'); ctx.fillRect(0, ruler - 1, w, 1);
+
+  // waveforms
+  const i0 = Math.max(0, Math.floor(iAt(0))), i1 = Math.min(data.length, Math.ceil(iAt(w)) + 1);
+  for (let ch = 0; ch < 8; ch++) {
+    const y = ruler + ch * rowH, hi = y + rowH * 0.24, lo = y + rowH * 0.76, m = 1 << ch;
+    ctx.fillStyle = COLORS[ch] + '1c';
+    ctx.beginPath();
+    let prev = data[i0] & m, runStart = i0;
+    ctx.moveTo(xOf(i0), prev ? hi : lo);
+    const highRun = (a, b) => ctx.fillRect(xOf(a), hi, xOf(b) - xOf(a), lo - hi);
+    for (let i = i0 + 1; i < i1; i++) {
+      const b = data[i] & m;
+      if (b !== prev) {
+        const x = xOf(i);
+        ctx.lineTo(x, prev ? hi : lo); ctx.lineTo(x, b ? hi : lo);
+        if (prev) highRun(runStart, i);
+        prev = b; runStart = i;
+      }
+    }
+    ctx.lineTo(xOf(i1), prev ? hi : lo);
+    if (prev) highRun(runStart, i1);
+    ctx.strokeStyle = COLORS[ch]; ctx.lineWidth = 1.5; ctx.lineJoin = 'miter'; ctx.stroke();
+  }
+
+  // trigger, marker, cursor
+  const vline = (x, color, dash) => {
+    ctx.save(); ctx.strokeStyle = color; ctx.setLineDash(dash); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(Math.round(x) + .5, ruler); ctx.lineTo(Math.round(x) + .5, h); ctx.stroke(); ctx.restore();
+  };
+  if (trigIdx !== null) {
+    const x = xOf(trigIdx);
+    vline(x, C('--accent-hi'), []);
+    ctx.fillStyle = C('--accent-hi'); ctx.beginPath(); ctx.moveTo(x - 6, ruler - 10); ctx.lineTo(x + 6, ruler - 10); ctx.lineTo(x, ruler - 1); ctx.fill();
+  }
+  if (marker !== null) vline(xOf(marker), '#e8e8e8', [4, 3]);
+  if (hoverX !== null) vline(hoverX, '#ffffff55', []);
+
+  readout();
+}
+
+function readout() {
+  $('r-span').textContent = fmtTime(W() * view.spp / rate);
+  if (hoverX === null || !data) return;
+  const i = Math.min(data.length - 1, Math.max(0, Math.round(iAt(hoverX))));
+  const v = data[i];
+  $('r-time').textContent = fmtTime((i - t0()) / rate);
+  $('r-idx').textContent = i;
+  $('r-val').textContent = '0x' + v.toString(16).padStart(2, '0').toUpperCase() + '  ' + v.toString(2).padStart(8, '0');
+  if (marker !== null) {
+    const dt = Math.abs(i - marker) / rate;
+    $('r-delta').textContent = dt ? `${fmtTime(dt)}  (${fmtHz(+(1 / dt).toPrecision(4))})` : '0';
+  }
+}
+
+// ---- interaction ----
+let drag = null;
+cv.addEventListener('wheel', e => {
+  if (!data) return;
+  e.preventDefault();
+  if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) view.start += e.deltaX * view.spp;
+  else { const s = iAt(e.offsetX); view.spp *= Math.exp(e.deltaY * 0.0025); view.start = s - e.offsetX * view.spp; }
+  clampView(); draw();
+}, { passive: false });
+cv.addEventListener('pointerdown', e => { drag = { x: e.offsetX, start: view.start, moved: false }; cv.setPointerCapture(e.pointerId); });
+cv.addEventListener('pointermove', e => {
+  hoverX = e.offsetX;
+  if (drag && Math.abs(e.offsetX - drag.x) > 3) {
+    drag.moved = true; cv.classList.add('dragging');
+    view.start = drag.start - (e.offsetX - drag.x) * view.spp; clampView();
+  }
+  draw();
+});
+cv.addEventListener('pointerup', e => {
+  if (drag && !drag.moved && data) { marker = Math.round(iAt(e.offsetX)); }
+  drag = null; cv.classList.remove('dragging'); draw();
+});
+cv.addEventListener('pointerleave', () => { hoverX = null; draw(); });
+addEventListener('keydown', e => {
+  if (e.target.tagName === 'SELECT') return;
+  if (e.key === 'f' || e.key === 'F') fit();
+  else if (e.key === 'Enter' && !$('capture').disabled) capture();
+  else if (e.key === 'Escape') { marker = null; $('r-delta').textContent = 'click to set a marker'; draw(); }
+});
+$('capture').onclick = capture;
+$('refresh').onclick = refreshPorts;
+new ResizeObserver(() => { clampView(); draw(); }).observe(cv);
+
+// ---- start ----
+if (tauri) refreshPorts().then(() => status('Ready.'));
+else {
+  // Demo signals so the viewer can be tried outside the app: a clock, an SPI-ish burst and a counter.
+  const n = 4096, d = new Uint8Array(n);
+  for (let i = 0; i < n; i++) {
+    const clk = (i >> 2) & 1, cs = i % 1024 > 200 && i % 1024 < 840 ? 0 : 1;
+    const sck = cs ? 0 : (i >> 3) & 1, mosi = cs ? 0 : (0xA5 >> ((i >> 4) & 7)) & 1;
+    d[i] = clk | cs << 1 | sck << 2 | mosi << 3 | ((i >> 7) & 0xf) << 4;
+  }
+  $('port').add(new Option('Demo data', ''));
+  show(d, 10e6, 1024);
+  status('Demo data: open in the Mojo LA app to capture.');
+}
+</script>
+</body>
+</html>

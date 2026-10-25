@@ -93,6 +93,11 @@ module mojo_top (
     wire trig = ((in ^ tval) & tmask) == 0;
     wire we   = tick && (state == ARMED || state == POST);
 
+    // Hold off the trigger until the buffer has the requested pre-trigger samples,
+    // or the start of the capture would be stale data from the previous run.
+    reg  [18:0] filled = 0;
+    wire [18:0] pre_need = (rcount > dcount) ? (rcount - dcount) * 4 : 0;
+
     reg [7:0] mem [0:DEPTH-1];
     reg [7:0] q;
     always @(posedge clk) begin
@@ -105,6 +110,7 @@ module mojo_top (
         do_long  <= 0;
         tick_cnt <= tick ? div >> 1 : tick_cnt - 1;
         if (we) wa <= wa + 1;
+        if (we && state == ARMED && filled != DEPTH) filled <= filled + 1;
 
         if (rst) begin
             state <= IDLE;
@@ -117,7 +123,7 @@ module mojo_top (
                     rp       <= rp + 1;
                     if (rp == rend) state <= IDLE;
                 end
-                ARMED: if (tick && trig) begin
+                ARMED: if (tick && trig && filled >= pre_need) begin
                     n     <= (dcount + 1) * 4;
                     state <= POST;
                 end
@@ -158,7 +164,7 @@ module mojo_top (
                     nargs <= 4;
                 end else case (rx_data)
                     8'h00: state <= IDLE;                                   // reset
-                    8'h01: begin state <= ARMED; tick_cnt <= 0; end         // run
+                    8'h01: begin state <= ARMED; tick_cnt <= 0; filled <= 0; end  // run
                     8'h02: begin state <= ROM; rp <= 0; rend <= 3;  end     // ID
                     8'h04: begin state <= ROM; rp <= 4; rend <= 27; end     // metadata
                     default: ;

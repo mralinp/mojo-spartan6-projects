@@ -23,6 +23,7 @@
 | Project | What it does | Resources |
 |---|---|---|
 | [**logic_analyzer**](logic_analyzer/) | 8-channel, 50 MHz, 16K-sample logic analyzer. Speaks the SUMP protocol, so PulseView / sigrok is the UI. | 7% slices, 8 of 32 BRAMs |
+| [**viewer**](viewer/) | **Mojo LA**, a desktop app (Tauri + Rust) that captures from the logic analyzer and draws the waveforms. | macOS app |
 | [**led_counter**](led_counter/) | 8-bit binary counter on the onboard LEDs. The "hello world" that proves the toolchain works. | 1% slices |
 
 ## Quick start
@@ -44,7 +45,7 @@ First time on a new Mac? See [Toolchain setup](#toolchain-setup) below.
 | Channels | 8 |
 | Max sample rate | 50 MHz |
 | Memory | 16,384 samples |
-| Trigger | pattern match (mask + value), pre/post-trigger split |
+| Trigger | pattern match (mask + value), pre/post-trigger split; holds off until the pre-trigger part is fresh |
 | Protocol | SUMP / Openbench Logic Sniffer |
 | Link | USB through the Mojo's AVR, 500 kbaud |
 
@@ -66,6 +67,17 @@ First time on a new Mac? See [Toolchain setup](#toolchain-setup) below.
 
 > [!WARNING]
 > Inputs are **3.3 V LVTTL and not 5 V tolerant**. Put a level shifter or divider in front of 5 V logic.
+
+**Capture with Mojo LA**, the bundled desktop app:
+
+```bash
+cd viewer/src-tauri && cargo run --release
+```
+
+Pick the port, sample rate, sample count and how much to keep before the trigger, click a channel's chip to trigger
+on it (`X` don't care → `0` → `1`), and press **Capture**. Scroll to zoom, drag to pan, click to drop a marker and
+read the time and frequency to the cursor. `npx @tauri-apps/cli@2 build` in `viewer/src-tauri` makes a `.app` and
+`.dmg`. Opening `viewer/ui/index.html` in a browser shows the viewer with demo data.
 
 **Capture with PulseView:** pick the driver *Openbench Logic Sniffer & SUMP compatibles*, serial port
 `/dev/cu.usbmodem*`, then *Scan for devices*. It shows up as **Mojo LA** with 8 channels. The 8 LEDs mirror the
@@ -123,6 +135,9 @@ Two quirks that cost real debugging time, written down so they don't cost it aga
 assets/logo.svg   the logo: a waveform M cut out of an FPGA chip
 logic_analyzer/   mojo_top.v (design + UARTs), mojo.ucf (pins), tb.v (testbench)
 led_counter/      mojo_top.v, mojo.ucf
+viewer/
+  ui/index.html   the whole frontend: canvas waveform view, no framework
+  src-tauri/      Rust side: serial port listing and SUMP capture
 tools/
   ise.sh          image / install / build, all through Docker
   Dockerfile      ISE runtime libraries (Ubuntu 18.04, linux/amd64)

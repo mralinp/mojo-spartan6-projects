@@ -48,6 +48,18 @@ module tb;
                 if (b != 8'h88 - i) $fatal(1, "sample %0d = %h, want %h", i, b, 8'h88 - i);
             end
         end join
+        // No trigger, 12 of 16 samples before it: all 16 must be fresh and consecutive,
+        // not leftovers from the capture above.
+        send_long(8'hC0, 0);
+        send_long(8'h81, {16'd0, 16'd3});
+        fork send(8'h01); begin
+            recv(prev);
+            for (i = 1; i < 16; i = i + 1) begin
+                recv(b);
+                if (b != prev - 8'd1) $fatal(1, "pre-trigger sample %0d = %h after %h", i, b, prev);
+                prev = b;
+            end
+        end join
         $display("PASS");
         $finish;
     end
