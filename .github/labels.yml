@@ -1,0 +1,18 @@
+# name: color description
+- {name: P0-critical, color: b60205, description: "Board can't be programmed or captures are wrong. Drop everything"}
+- {name: P1-high, color: d93f0b, description: "Blocks the next project"}
+- {name: P2-medium, color: fbca04, description: "Normal priority"}
+- {name: P3-low, color: 0e8a16, description: "Nice to have"}
+- {name: type/feature, color: 1d76db, description: "New capability"}
+- {name: type/bug, color: d73a4a, description: "Something is broken"}
+- {name: type/task, color: 5319e7, description: "Planned piece of work"}
+- {name: type/research, color: c5def5, description: "Investigation, nothing changes"}
+- {name: type/docs, color: 0075ca, description: "Documentation"}
+- {name: area/fpga, color: bfd4f2, description: "Verilog, constraints, bitstreams"}
+- {name: area/viewer, color: bfd4f2, description: "Mojo LA desktop app"}
+- {name: area/tooling, color: bfd4f2, description: "ISE in Docker, loader, scripts, repo"}
+- {name: risk/hardware, color: "000000", description: "Can damage the board or what it's wired to (voltages, pin conflicts)"}
+- {name: risk/flash, color: "000000", description: "Rewrites the Mojo's flash; recover by replugging and reloading"}
+- {name: blocked, color: e99695, description: "Waiting on something"}
+- {name: needs-info, color: e99695, description: "Needs more information"}
+- {name: good-first-task, color: 7057ff, description: "Small and well-defined"}

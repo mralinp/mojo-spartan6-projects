@@ -1,0 +1,15 @@
+name: Bug
+description: Something is broken
+labels: ["type/bug"]
+body:
+  - type: textarea
+    id: what
+    attributes: {label: What happened, description: "Expected vs actual"}
+    validations: {required: true}
+  - type: textarea
+    id: repro
+    attributes: {label: Steps / evidence, description: "Commands, capture settings, logs, screenshots"}
+    validations: {required: true}
+  - type: input
+    id: env
+    attributes: {label: Bitstream / app / repo commit}

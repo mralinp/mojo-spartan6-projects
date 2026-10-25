@@ -137,6 +137,15 @@ Two quirks that cost real debugging time, written down so they don't cost it aga
   freezes it when its buffer is nearly full. Treating it as a level deadlocks the FPGA; ignoring it drops a third of
   a 16K capture. The analyzer sends one byte per edge, and a full 16K capture now arrives intact in about a second.
 
+## Contributing
+
+Every change starts as an issue (Task or Bug form) and lands through a pull request:
+
+1. Open an issue; labels say its type (`type/*`), area (`area/fpga`, `area/viewer`, `area/tooling`), priority (`P0`–`P3`) and hardware risk (`risk/*`).
+2. Branch off `main` as `type/<issue>-slug`, e.g. `feature/7-spi-decoder`.
+3. Commit in conventional style: `feat(viewer): decode SPI on any two channels`.
+4. Open a PR that says `Closes #<issue>`; it's squash-merged into `main`.
+
 ## Layout
 
 ```
