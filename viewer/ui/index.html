@@ -26,13 +26,14 @@
   select, button { font: 13px var(--ui); color: var(--fg); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
   select:focus-visible, button:focus-visible { outline: 2px solid var(--accent-hi); outline-offset: 1px; }
   .port { display: flex; gap: 4px; }
-  .port select { min-width: 210px; }
+  .port select { min-width: 170px; }
   button { cursor: pointer; }
   button.icon { padding: 5px 8px; }
   #capture { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; padding: 8px 18px; margin-left: 4px; }
   #capture:hover { background: var(--accent-hi); }
   #capture:disabled, #auto:disabled, #run:disabled { opacity: .55; cursor: progress; }
-  .actions { display: flex; gap: 6px; align-items: center; }
+  .actions, .files { display: flex; gap: 6px; align-items: center; }
+  .files button, .files select { font-size: 12px; padding: 5px 9px; }
   #auto, #run { padding: 8px 14px; font-weight: 600; }
   #run[aria-pressed="true"] { border-color: var(--accent-hi); color: #fff; }
   #run[aria-pressed="true"]::before { content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 7px; border-radius: 50%; background: var(--accent-hi); vertical-align: 1px; animation: blink 1s steps(2) infinite; }
@@ -124,6 +125,15 @@
     <button id="run" aria-pressed="false" title="Capture continuously (Space)">Run</button>
     <button id="capture" title="One capture (Enter)">Capture</button>
   </div>
+  <div class="files">
+    <button id="open" title="Open a saved capture (⌘O)">Open</button>
+    <button id="save" title="Save this capture with its names and decoders (⌘S)">Save</button>
+    <select id="export" title="Export this capture" aria-label="Export this capture">
+      <option value="">Export…</option>
+      <option value="vcd" title="Opens in GTKWave and PulseView">VCD</option>
+      <option value="csv" title="For spreadsheets">CSV</option>
+    </select>
+  </div>
   <div id="status"></div>
 </header>
 
@@ -169,6 +179,7 @@
 <script src="uart.js"></script>
 <script src="measure.js"></script>
 <script src="buses.js"></script>
+<script src="files.js"></script>
 <script>
 // Probe-lead colours, as on Saleae/sigrok harnesses: black, brown, red, orange, yellow, green, blue, violet.
 const COLORS = ['#a3a9b2', '#c08a5c', '#ef4f57', '#f2913f', '#f2cc4c', '#4cb764', '#4c96f7', '#a77ce6'];
@@ -183,12 +194,12 @@ const tauri = window.__TAURI__;
 const $ = id => document.getElementById(id);
 const cv = $('cv'), ctx = cv.getContext('2d');
 
-let data = null, rate = 1e6, trigIdx = null;
+let data = null, rate = 1e6, trigIdx = null, takenAt = null;
 let view = { start: 0, spp: 1 };          // first visible sample, samples per CSS pixel
 let hoverX = null, marker = null, markerB = null; // A: click, B: shift-click
 let edgesAll = [], edgesBy = [];          // edges on any channel / per channel, for marker snapping
 const trig = Array(8).fill('X');          // per channel: X (don't care), 0, 1
-const trigBtns = [];
+const trigBtns = [], uartBtns = [], nameRefresh = [];
 // Header pin behind each channel (see logic_analyzer/mojo.ucf), shown under its name.
 const PINS = [51, 50, 41, 40, 35, 34, 33, 32];
 const NAMES_KEY = 'mojo-la.channel-names';
@@ -233,6 +244,7 @@ for (let ch = 0; ch < 8; ch++) {
     nm.querySelector('small').textContent = names[ch] ? `D${ch} · P${PINS[ch]}` : `P${PINS[ch]}`;
   };
   showName();
+  nameRefresh[ch] = showName;
   nm.onclick = () => {
     const input = document.createElement('input');
     input.className = 'rename'; input.maxLength = 12; input.value = names[ch] || ''; input.placeholder = `D${ch}`;
@@ -252,6 +264,7 @@ for (let ch = 0; ch < 8; ch++) {
   };
   const b = row.querySelector('.trig'), u = row.querySelector('.uart');
   trigBtns[ch] = b;
+  uartBtns[ch] = u;
   b.onclick = () => setTrig(ch, { X: '0', 0: '1', 1: 'X' }[trig[ch]]);
   u.onclick = () => { uartOn[ch] = !uartOn[ch]; u.setAttribute('aria-pressed', uartOn[ch]); decode(); draw(); };
   $('gutter').append(row);
@@ -352,7 +365,7 @@ async function auto() {
 }
 
 function show(d, r, t, keepView = false) {
-  data = d; rate = r; trigIdx = t;
+  data = d; rate = r; trigIdx = t; takenAt = new Date().toISOString();
   if (!keepView) marker = markerB = null;
   edgesAll = []; edgesBy = [[], [], [], [], [], [], [], []];
   for (let i = 1; i < d.length; i++) {
@@ -366,6 +379,85 @@ function show(d, r, t, keepView = false) {
   renderMeasure(true);
   if (keepView) { clampView(); draw(); } else autoView();
 }
+
+// ---- files: save, open, export ----
+const basename = p => String(p).split(/[\\/]/).pop();
+const stamp = () => new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
+const current = () => ({ samples: data, rate, trigIdx, takenAt, names: Array.from({ length: 8 }, (_, ch) => names[ch] || null),
+  uartOn: [...uartOn], baud: +$('baud').value, buses });
+
+/** Save dialog in the app, a download in a browser. Returns the name saved to, or null if cancelled. */
+async function saveText(name, text, ext, what) {
+  if (tauri) {
+    const path = await tauri.core.invoke('plugin:dialog|save', { options: { defaultPath: name, filters: [{ name: what, extensions: [ext] }] } });
+    if (!path) return null;
+    await tauri.core.invoke('write_text', { path, contents: text });
+    return path;
+  }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  return name;
+}
+async function saveCapture() {
+  if (!data) return status('Nothing to save yet: capture something first.', true);
+  try {
+    const at = await saveText(`mojo-la-${stamp()}.mojola`, serializeCapture(current()), 'mojola', 'Mojo LA capture');
+    if (at) status(`Saved ${basename(at)}`);
+  } catch (e) { status(String(e), true); }
+}
+async function exportAs(kind) {
+  if (!data) return status('Nothing to export yet: capture something first.', true);
+  try {
+    const text = kind === 'vcd' ? toVCD(current(), label) : toCSV(current(), label);
+    const at = await saveText(`mojo-la-${stamp()}.${kind}`, text, kind, kind === 'vcd' ? 'Value change dump' : 'CSV');
+    if (at) status(`Exported ${basename(at)}`);
+  } catch (e) { status(String(e), true); }
+}
+const pickFile = () => new Promise(resolve => {
+  const i = document.createElement('input');
+  i.type = 'file'; i.accept = '.mojola';
+  i.onchange = () => resolve(i.files[0] || null);
+  i.click();
+});
+async function openCapture() {
+  try {
+    let text, name;
+    if (tauri) {
+      const path = await tauri.core.invoke('plugin:dialog|open', { options: { multiple: false, directory: false, filters: [{ name: 'Mojo LA capture', extensions: ['mojola'] }] } });
+      if (!path) return;
+      text = await tauri.core.invoke('read_text', { path }); name = path;
+    } else {
+      const f = await pickFile();
+      if (!f) return;
+      text = await f.text(); name = f.name;
+    }
+    loadCapture(parseCapture(text), name);
+  } catch (e) { status(e.message ?? String(e), true); }
+}
+/** Puts a saved capture back exactly as it was: samples, names, UART chips, baud setting and buses. */
+function loadCapture(c, name) {
+  running = false;
+  for (let ch = 0; ch < 8; ch++) {
+    names[ch] = c.names[ch] || '';
+    uartOn[ch] = c.uartOn[ch];
+    uartBtns[ch].setAttribute('aria-pressed', uartOn[ch]);
+    nameRefresh[ch]();
+  }
+  saveNames();
+  $('baud').value = [...$('baud').options].some(o => +o.value === c.baud) ? c.baud : 0;
+  buses.splice(0, buses.length, ...c.buses);
+  saveBuses(); renderBuses();
+  show(c.samples, c.rate, c.trigIdx);
+  takenAt = c.takenAt;
+  status(`Opened ${basename(name)} · ${c.samples.length.toLocaleString()} samples at ${fmtHz(c.rate)}` +
+    (c.takenAt ? ` · taken ${new Date(c.takenAt).toLocaleString()}` : ''));
+}
+$('open').onclick = openCapture;
+$('save').onclick = saveCapture;
+$('export').onchange = e => { const k = e.target.value; e.target.value = ''; if (k) exportAs(k); };
 
 // ---- measurements ----
 let measuredFor = '';
@@ -735,6 +827,7 @@ cv.addEventListener('pointerup', e => {
 });
 cv.addEventListener('pointerleave', () => { hoverX = null; draw(); });
 addEventListener('keydown', e => {
+  if ((e.metaKey || e.ctrlKey) && (e.key === 's' || e.key === 'o')) { e.preventDefault(); (e.key === 's' ? saveCapture : openCapture)(); return; }
   if (e.target.tagName === 'SELECT' || e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' && (e.key === 'Enter' || e.key === ' ')) return;
   if (e.key === 'f' || e.key === 'F') fit();
   else if (e.key === 'Enter' && !$('capture').disabled) capture();
