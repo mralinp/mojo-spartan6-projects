@@ -105,6 +105,10 @@ It works like an oscilloscope:
 After every capture the view jumps to where the data begins: the trigger, or the first edge, through the end of
 that first burst. With UART decoding on, that's the first message. `F` zooms out to the whole capture.
 
+**Name your lines.** Click a channel's name (D0–D7) to rename it, say `TX`, `RX` or `SDA`, then press Enter (Esc
+cancels, an empty name goes back to D0). The name shows everywhere, including the UART dump and copied logs, with the
+original channel and its header pin underneath (`D0 · P51`), and it's remembered next time.
+
 To set things by hand, pick the sample rate, sample count and how much to keep before the trigger, and click a
 channel's chip to trigger on it (`X` don't care → `0` → `1`). Scroll to zoom, drag to pan, click to drop a marker
 and read the time and frequency to the cursor.
