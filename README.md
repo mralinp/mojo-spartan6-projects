@@ -110,6 +110,46 @@ jump to it, or **Copy dump** for a text log. Sample at 8× the baud rate or more
 </p> `npx @tauri-apps/cli@2 build` in `viewer/src-tauri` makes a `.app` and
 `.dmg`. Opening `viewer/ui/index.html` in a browser shows the viewer with demo data.
 
+### Try it on a real UART: Arduino Pro Micro
+
+[`examples/pro_micro_uart`](examples/pro_micro_uart/pro_micro_uart.ino) makes known traffic to capture. The Pro
+Micro talks on `Serial1` to a USB-TTL dongle: it sends `tick N` every 100 ms and echoes back every line it receives.
+The Mojo taps both wires.
+
+| From | To |
+|---|---|
+| Dongle TX | Pro Micro **RXI** |
+| Dongle RX | Pro Micro **TXO** |
+| Mojo **D0** (P51) | Pro Micro **TXO** |
+| Mojo **D1** (P50) | Pro Micro **RXI** |
+| Mojo GND, dongle GND | Pro Micro GND |
+
+> [!WARNING]
+> The 5 V / 16 MHz Pro Micro drives 5 V on TXO, and the dongle may drive 5 V on RXI. The Mojo takes **3.3 V only**.
+> Use the 3.3 V / 8 MHz Pro Micro with the dongle set to 3.3 V, or put a divider on each probe line
+> (1 kΩ in series, 2 kΩ to GND gives 3.3 V from 5 V).
+
+**Upload** with the board that matches yours: picking the wrong clock speed halves or doubles the baud rate.
+
+```bash
+arduino-cli compile --upload --fqbn arduino:avr:leonardo -p /dev/cu.usbmodemXXXX examples/pro_micro_uart  # 5 V / 16 MHz
+```
+
+For the 3.3 V / 8 MHz board, add SparkFun's board package and use `--fqbn SparkFun:avr:promicro:cpu=8MHzatmega32U4`.
+On Apple silicon the Arduino AVR compiler is an Intel binary, so it needs Rosetta
+(`softwareupdate --install-rosetta`); otherwise compiling fails with "bad CPU type in executable".
+
+**Capture** in Mojo LA:
+
+1. Pick the **Mojo's** port. The Pro Micro and the dongle show up as serial ports too.
+2. Set 1 MHz and 16K samples, click D0's trigger chip to `0` and set *Before trigger* to 10%.
+3. Press **Capture**. It waits for the next start bit on TXO and shows `tick N\r\n` decoded on D0.
+4. To see the echo, set D1's trigger to `0` (and D0's back to `X`), press Capture, then send a whole line through
+   the dongle. D1 shows your line, and D0 the echo right after it:
+   ```bash
+   .venv/bin/python -c "import serial; serial.Serial('/dev/cu.usbserial-XXXX', 115200).write(b'hello mojo\r\n')"
+   ```
+
 **Capture with PulseView:** pick the driver *Openbench Logic Sniffer & SUMP compatibles*, serial port
 `/dev/cu.usbmodem*`, then *Scan for devices*. It shows up as **Mojo LA** with 8 channels.
 
@@ -182,6 +222,8 @@ version, a `fix` or anything else the patch, and a `!` (like `feat!:`) or `BREAK
 assets/logo.svg   the logo: a waveform M cut out of an FPGA chip
 logic_analyzer/   mojo_top.v (design + UARTs), mojo.ucf (pins), tb.v (testbench)
 led_counter/      mojo_top.v, mojo.ucf
+examples/
+  pro_micro_uart/ Arduino Pro Micro sketch: UART traffic to test the analyzer with
 viewer/
   ui/index.html   the whole frontend: canvas waveform view, no framework
   src-tauri/      Rust side: serial port listing and SUMP capture
