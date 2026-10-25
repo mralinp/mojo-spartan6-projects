@@ -86,8 +86,10 @@ jump to it, or **Copy dump** for a text log. Sample at 8× the baud rate or more
 `.dmg`. Opening `viewer/ui/index.html` in a browser shows the viewer with demo data.
 
 **Capture with PulseView:** pick the driver *Openbench Logic Sniffer & SUMP compatibles*, serial port
-`/dev/cu.usbmodem*`, then *Scan for devices*. It shows up as **Mojo LA** with 8 channels. The 8 LEDs mirror the
-probe inputs live, which helps when wiring up.
+`/dev/cu.usbmodem*`, then *Scan for devices*. It shows up as **Mojo LA** with 8 channels.
+
+**LEDs:** each edge on a probe lights its LED for 50 ms, so you can see which lines are talking (a busy UART looks
+solidly lit) before you capture. Quiet lines stay dark whatever their level.
 
 **From the command line:**
 

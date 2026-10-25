@@ -34,7 +34,19 @@ module mojo_top (
 
     reg [7:0] p1, in;                           // 2-FF synchronizer
     always @(posedge clk) begin p1 <= probe; in <= p1; end
-    assign led = in;                            // live view of the probes
+    // LEDs show activity: every edge on a probe lights its LED for BLINK cycles,
+    // so traffic too fast to see (a UART, SPI) shows up as a visible blink.
+    localparam BLINK = 2_500_000;               // 50 ms at 50 MHz; tune to taste
+    reg [7:0] in_d;
+    always @(posedge clk) in_d <= in;
+    genvar g;
+    generate for (g = 0; g < 8; g = g + 1) begin : activity
+        reg [21:0] t = 0;
+        always @(posedge clk)
+            if (in[g] ^ in_d[g]) t <= BLINK;
+            else if (t != 0)     t <= t - 1;
+        assign led[g] = t != 0;
+    end endgenerate
 
     wire [7:0] rx_data;
     wire       rx_new;
