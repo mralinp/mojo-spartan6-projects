@@ -109,6 +109,12 @@ that first burst. With UART decoding on, that's the first message. `F` zooms out
 cancels, an empty name goes back to D0). The name shows everywhere, including the UART dump and copied logs, with the
 original channel and its header pin underneath (`D0 · P51`), and it's remembered next time.
 
+**Measure without counting.** The **Measurements** tab under the waveform lists every channel's edge count,
+frequency and period (rising edge to rising edge), duty cycle, and the min / mean / max width of its high and low
+pulses. Only whole pulses count. Choose *whole capture* or *visible window*; the window follows your zoom. For
+anything else, click to drop marker A and Shift-click for marker B. Both snap to the nearest edge on the row you
+click, and the footer shows the time between them and its frequency. Tests: `node viewer/ui/measure.test.js`.
+
 To set things by hand, pick the sample rate, sample count and how much to keep before the trigger, and click a
 channel's chip to trigger on it (`X` don't care → `0` → `1`). Scroll to zoom, drag to pan, click to drop a marker
 and read the time and frequency to the cursor.
