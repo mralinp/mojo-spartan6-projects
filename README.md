@@ -18,6 +18,11 @@
   <img alt="Host" src="https://img.shields.io/badge/host-macOS%20(Apple%20silicon)-555">
 </p>
 
+<p align="center">
+  <img src="docs/screenshots/overview.png" alt="Mojo LA showing a 16 ms capture: an AT-command exchange on D0 and D1 decoded as UART at an auto-detected 115,200 baud, a clock and counter bits on D2 to D7, and the UART dump panel listing each byte" width="900">
+  <br><sub>Mojo LA with its built-in demo data: an AT-command exchange on D0/D1, decoded as UART.</sub>
+</p>
+
 ---
 
 ## Projects
@@ -97,7 +102,12 @@ read the time and frequency to the cursor.
 by default (toggle with each channel's **UART** chip). The baud rate is detected from the pulse widths, or pick it.
 Bytes are labeled on the waveform, and the dump panel lists every byte with its time, hex and ASCII; click one to
 jump to it, or **Copy dump** for a text log. Sample at 8× the baud rate or more: 1 MHz with 16K samples covers
-16 ms, about 180 bytes at 115200. Decoder test: `node viewer/ui/uart.test.js`. `npx @tauri-apps/cli@2 build` in `viewer/src-tauri` makes a `.app` and
+16 ms, about 180 bytes at 115200. Decoder test: `node viewer/ui/uart.test.js`.
+
+<p align="center">
+  <img src="docs/screenshots/uart-zoom.png" alt="Close-up of D0 with each UART frame boxed and labeled 41 A, 54 T, 2B +, and a marker measuring one 10-bit frame as 86 microseconds" width="900">
+  <br><sub>Zoomed in: each frame is boxed with its byte, and a marker measures one 10-bit frame (86 µs at 115,200 baud).</sub>
+</p> `npx @tauri-apps/cli@2 build` in `viewer/src-tauri` makes a `.app` and
 `.dmg`. Opening `viewer/ui/index.html` in a browser shows the viewer with demo data.
 
 **Capture with PulseView:** pick the driver *Openbench Logic Sniffer & SUMP compatibles*, serial port
