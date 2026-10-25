@@ -10,6 +10,8 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/mralinp/mojo-spartan6-projects/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/mralinp/mojo-spartan6-projects/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/mralinp/mojo-spartan6-projects/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/mralinp/mojo-spartan6-projects?label=Mojo%20LA"></a>
   <img alt="FPGA" src="https://img.shields.io/badge/FPGA-Spartan--6%20XC6SLX9-c41e3a">
   <img alt="Language" src="https://img.shields.io/badge/HDL-Verilog-1f6feb">
   <img alt="Toolchain" src="https://img.shields.io/badge/ISE%2014.7-in%20Docker-2496ed">
@@ -23,7 +25,7 @@
 | Project | What it does | Resources |
 |---|---|---|
 | [**logic_analyzer**](logic_analyzer/) | 8-channel, 50 MHz, 16K-sample logic analyzer. Speaks the SUMP protocol, so PulseView / sigrok is the UI. | 7% slices, 8 of 32 BRAMs |
-| [**viewer**](viewer/) | **Mojo LA**, a desktop app (Tauri + Rust) that captures from the logic analyzer and draws the waveforms. | macOS app |
+| [**viewer**](viewer/) | **Mojo LA**, a desktop app (Tauri + Rust) that captures from the logic analyzer, draws the waveforms and decodes UART. | macOS, Windows, Linux |
 | [**led_counter**](led_counter/) | 8-bit binary counter on the onboard LEDs. The "hello world" that proves the toolchain works. | 1% slices |
 
 ## Quick start
@@ -34,6 +36,19 @@ tools/ise.sh build logic_analyzer                                   # Verilog ->
 ```
 
 First time on a new Mac? See [Toolchain setup](#toolchain-setup) below.
+
+## Download Mojo LA
+
+Every merge to `main` publishes a release on the [Releases page](https://github.com/mralinp/mojo-spartan6-projects/releases/latest), each file with a `.sha256` next to it:
+
+| OS | File |
+|---|---|
+| macOS (Apple silicon and Intel) | `Mojo-LA_<version>_universal.dmg` |
+| Windows | `Mojo-LA_<version>_x64-setup.exe` or `.msi` |
+| Linux | `.deb` or `.AppImage` |
+
+The builds aren't code-signed. On macOS, right-click the app and choose **Open** the first time; on Windows, choose
+**More info → Run anyway**. Bitstreams aren't in releases: ISE can't run in CI, so build them with `tools/ise.sh`.
 
 ## Logic analyzer
 
@@ -144,7 +159,12 @@ Every change starts as an issue (Task or Bug form) and lands through a pull requ
 1. Open an issue; labels say its type (`type/*`), area (`area/fpga`, `area/viewer`, `area/tooling`), priority (`P0`–`P3`) and hardware risk (`risk/*`).
 2. Branch off `main` as `type/<issue>-slug`, e.g. `feature/7-spi-decoder`.
 3. Commit in conventional style: `feat(viewer): decode SPI on any two channels`.
-4. Open a PR that says `Closes #<issue>`; it's squash-merged into `main`.
+4. Open a PR that says `Closes #<issue>`; its title must be a Conventional Commit too, since it becomes the squash
+   commit. CI runs the checks and builds Mojo LA on all three platforms.
+
+**Versioning is automatic.** On every merge, CI reads the commits since the last tag: a `feat` bumps the minor
+version, a `fix` or anything else the patch, and a `!` (like `feat!:`) or `BREAKING CHANGE` the major. It then tags
+`vX.Y.Z`, builds the installers with that version and publishes the release with a changelog grouped by type.
 
 ## Layout
 

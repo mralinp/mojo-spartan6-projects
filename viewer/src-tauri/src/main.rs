@@ -30,13 +30,23 @@ fn list_ports() -> Vec<String> {
         .unwrap_or_default()
         .into_iter()
         .map(|p| p.port_name)
-        .filter(|n| !n.starts_with("/dev/tty.") && !n.contains("Bluetooth") && !n.contains("debug-console"))
+        .filter(|n| {
+            !n.starts_with("/dev/tty.") && !n.contains("Bluetooth") && !n.contains("debug-console")
+        })
         .collect();
     ports.sort_by_key(|n| !n.contains("usbmodem")); // the Mojo first
     ports
 }
 
-fn run(port: &str, rate: u32, samples: u32, post: u32, mask: u8, value: u8, wait_s: u64) -> Result<Vec<u8>, String> {
+fn run(
+    port: &str,
+    rate: u32,
+    samples: u32,
+    post: u32,
+    mask: u8,
+    value: u8,
+    wait_s: u64,
+) -> Result<Vec<u8>, String> {
     let io = |e: std::io::Error| format!("{port}: {e}");
     let mut p = serialport::new(port, 115_200)
         .timeout(Duration::from_millis(300))
@@ -50,10 +60,13 @@ fn run(port: &str, rate: u32, samples: u32, post: u32, mask: u8, value: u8, wait
     p.write_all(&[0x02]).map_err(io)?;
     let mut id = [0u8; 4];
     if p.read_exact(&mut id).is_err() || &id != b"1ALS" {
-        return Err(format!("No logic analyzer answered on {port}. Is the logic_analyzer bitstream flashed?"));
+        return Err(format!(
+            "No logic analyzer answered on {port}. Is the logic_analyzer bitstream flashed?"
+        ));
     }
 
-    p.write_all(&setup(rate, samples, post, mask, value)).map_err(io)?;
+    p.write_all(&setup(rate, samples, post, mask, value))
+        .map_err(io)?;
     p.write_all(&[0x01]).map_err(io)?;
 
     let mut buf = vec![0u8; samples as usize];
@@ -80,10 +93,20 @@ fn run(port: &str, rate: u32, samples: u32, post: u32, mask: u8, value: u8, wait
 }
 
 #[tauri::command]
-async fn capture(port: String, rate: u32, samples: u32, post: u32, mask: u8, value: u8, wait_s: u64) -> Result<Vec<u8>, String> {
-    tauri::async_runtime::spawn_blocking(move || run(&port, rate, samples, post, mask, value, wait_s))
-        .await
-        .map_err(|e| e.to_string())?
+async fn capture(
+    port: String,
+    rate: u32,
+    samples: u32,
+    post: u32,
+    mask: u8,
+    value: u8,
+    wait_s: u64,
+) -> Result<Vec<u8>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        run(&port, rate, samples, post, mask, value, wait_s)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 fn main() {
@@ -105,7 +128,10 @@ mod tests {
         assert_eq!(&b[5..10], &[0x81, 0xFF, 0x0F, 0xFF, 0x03]);
         assert_eq!(&b[10..20], &[0xC0, 1, 0, 0, 0, 0xC1, 1, 0, 0, 0]);
         // post is clamped to the 4..=samples range the hardware counts in
-        assert_eq!(&setup(50_000_000, 1024, 0, 0, 0)[5..10], &[0x81, 0xFF, 0x00, 0x00, 0x00]);
+        assert_eq!(
+            &setup(50_000_000, 1024, 0, 0, 0)[5..10],
+            &[0x81, 0xFF, 0x00, 0x00, 0x00]
+        );
     }
 
     /// Needs a Mojo with the logic_analyzer bitstream: cargo test -- --ignored
