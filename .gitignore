@@ -4,4 +4,4 @@ build/
 # Xilinx license: personal, never commit
 *.lic
 target/
-gen/schemas/
+**/gen/schemas/

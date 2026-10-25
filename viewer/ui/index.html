@@ -11,12 +11,12 @@
     --fg: #d8dbe0; --dim: #7d838d; --accent: #d4202c; --accent-hi: #ec3a45;
     --ui: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
     --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-    --ruler: 30px; --gutter: 96px;
+    --ruler: 30px; --gutter: 140px;
     color-scheme: dark;
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
-  body { background: var(--bg); color: var(--fg); font: 13px/1.4 var(--ui); display: grid; grid-template-rows: auto 1fr auto; overflow: hidden; }
+  body { background: var(--bg); color: var(--fg); font: 13px/1.4 var(--ui); display: grid; grid-template-rows: auto 1fr auto auto; overflow: hidden; }
 
   header { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; padding: 10px 14px; background: var(--panel); border-bottom: 1px solid var(--line); }
   .brand { display: flex; align-items: center; gap: 8px; font-weight: 600; letter-spacing: .02em; margin-right: 6px; }
@@ -42,7 +42,23 @@
   .ch .name { font: 600 12px var(--mono); flex: 1; }
   .trig { font: 600 11px var(--mono); width: 26px; padding: 3px 0; text-align: center; border-radius: 4px; color: var(--dim); }
   .trig[data-v="0"], .trig[data-v="1"] { color: #fff; border-color: var(--accent); background: color-mix(in srgb, var(--accent) 35%, transparent); }
+  .uart { font: 600 10px var(--mono); padding: 3px 5px; border-radius: 4px; color: var(--dim); }
+  .uart[aria-pressed="true"] { color: var(--bg); background: var(--fg); border-color: var(--fg); }
   .plot { position: relative; min-width: 0; }
+
+  #dump { border-top: 1px solid var(--line); background: var(--panel); display: grid; grid-template-rows: auto 1fr; height: 190px; min-height: 0; }
+  #dump .bar { display: flex; align-items: center; gap: 16px; padding: 6px 14px; border-bottom: 1px solid var(--line); min-width: 0; }
+  #dump h2 { font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); margin: 0; font-weight: 600; }
+  #streams { display: flex; gap: 18px; flex: 1; min-width: 0; font: 12px var(--mono); }
+  #streams span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  #warn { color: #f2cc4c; font-size: 12px; }
+  #copy { font-size: 12px; padding: 3px 10px; }
+  #frames { overflow: auto; font: 12px/1.7 var(--mono); padding: 4px 0; font-variant-numeric: tabular-nums; }
+  #frames div { display: grid; grid-template-columns: 110px 34px 34px 60px 1fr; gap: 8px; padding: 0 14px; cursor: pointer; }
+  #frames div:hover { background: var(--grid); }
+  #frames .t { color: var(--dim); text-align: right; }
+  #frames .err { color: #ff8a8f; }
+  #frames .empty { cursor: default; color: var(--dim); font-family: var(--ui); display: block; }
   canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; cursor: crosshair; }
   canvas.dragging { cursor: grabbing; }
 
@@ -64,6 +80,7 @@
   <label class="field">Sample rate <select id="rate"></select></label>
   <label class="field">Samples <select id="samples"></select></label>
   <label class="field">Before trigger <select id="pre"></select></label>
+  <label class="field">UART baud <select id="baud"></select></label>
   <button id="capture">Capture</button>
   <div id="status"></div>
 </header>
@@ -72,6 +89,16 @@
   <div class="gutter" id="gutter"><div class="spacer">Trigger</div></div>
   <div class="plot"><canvas id="cv"></canvas></div>
 </main>
+
+<section id="dump" hidden>
+  <div class="bar">
+    <h2>UART dump</h2>
+    <div id="streams"></div>
+    <span id="warn"></span>
+    <button id="copy">Copy dump</button>
+  </div>
+  <div id="frames"></div>
+</section>
 
 <footer>
   <span>t <b id="r-time">–</b></span>
@@ -82,6 +109,7 @@
   <span class="keys"><kbd>scroll</kbd> zoom · <kbd>drag</kbd> pan · <kbd>F</kbd> fit · <kbd>Enter</kbd> capture · <kbd>Esc</kbd> clear marker</span>
 </footer>
 
+<script src="uart.js"></script>
 <script>
 // Probe-lead colours, as on Saleae/sigrok harnesses: black, brown, red, orange, yellow, green, blue, violet.
 const COLORS = ['#a3a9b2', '#c08a5c', '#ef4f57', '#f2913f', '#f2cc4c', '#4cb764', '#4c96f7', '#a77ce6'];
@@ -99,6 +127,8 @@ let data = null, rate = 1e6, trigIdx = null;
 let view = { start: 0, spp: 1 };          // first visible sample, samples per CSS pixel
 let hoverX = null, marker = null;
 const trig = Array(8).fill('X');          // per channel: X (don't care), 0, 1
+const uartOn = [true, true, false, false, false, false, false, false];
+let decoded = [];                         // per channel: {baud, frames} or null
 
 const fmtHz = f => f >= 1e6 ? f / 1e6 + ' MHz' : f >= 1e3 ? f / 1e3 + ' kHz' : f + ' Hz';
 function fmtTime(s) {
@@ -110,15 +140,19 @@ const fill = (sel, items, fmt, def) => { for (const v of items) sel.add(new Opti
 fill($('rate'), RATES, fmtHz, 1e6);
 fill($('samples'), SIZES, n => n / 1024 + 'K', 16384);
 fill($('pre'), PRE, p => p + '%', 25);
+fill($('baud'), [0, ...UART_BAUDS], b => b ? b.toLocaleString() : 'Auto', 0);
+$('baud').onchange = () => { decode(); draw(); };
 
 // Channel gutter with trigger chips
 for (let ch = 0; ch < 8; ch++) {
   const row = document.createElement('div');
   row.className = 'ch';
   row.innerHTML = `<span class="swatch" style="background:${COLORS[ch]}"></span><span class="name">D${ch}</span>
+    <button class="uart" aria-pressed="${uartOn[ch]}" title="Decode D${ch} as UART">UART</button>
     <button class="trig" data-v="X" title="Trigger on D${ch}: don't care, low or high">X</button>`;
-  const b = row.querySelector('button');
+  const b = row.querySelector('.trig'), u = row.querySelector('.uart');
   b.onclick = () => { trig[ch] = { X: '0', 0: '1', 1: 'X' }[trig[ch]]; b.dataset.v = b.textContent = trig[ch]; };
+  u.onclick = () => { uartOn[ch] = !uartOn[ch]; u.setAttribute('aria-pressed', uartOn[ch]); decode(); draw(); };
   $('gutter').append(row);
 }
 
@@ -155,7 +189,67 @@ async function capture() {
   }
 }
 
-function show(d, r, t) { data = d; rate = r; trigIdx = t; marker = null; fit(); }
+function show(d, r, t) { data = d; rate = r; trigIdx = t; marker = null; decode(); fit(); }
+
+// ---- UART ----
+const esc = b => b === 10 ? '\\n' : b === 13 ? '\\r' : b === 9 ? '\\t' : b >= 32 && b < 127 ? String.fromCharCode(b) : '·';
+const hex = b => b.toString(16).padStart(2, '0').toUpperCase();
+
+function decode() {
+  decoded = uartOn.map((on, ch) => {
+    if (!on || !data) return null;
+    const baud = +$('baud').value || guessBaud(data, ch, rate);
+    return baud ? { baud, frames: decodeUart(data, ch, rate, baud) } : { baud: null, frames: [] };
+  });
+  renderDump();
+}
+
+function allFrames() {
+  return decoded.flatMap((d, ch) => d ? d.frames.map(f => ({ ...f, ch })) : []).sort((a, b) => a.start - b.start);
+}
+
+function renderDump() {
+  const on = decoded.some(Boolean);
+  $('dump').hidden = !on;
+  if (!on) return;
+  $('streams').innerHTML = '';
+  const slow = [];
+  decoded.forEach((d, ch) => {
+    if (!d) return;
+    const s = document.createElement('span');
+    s.innerHTML = `<b style="color:${COLORS[ch]}">D${ch}</b> ${d.baud ? d.baud.toLocaleString() + ' baud' : 'idle'}: `;
+    s.append(d.frames.map(f => esc(f.byte)).join('') || '–');
+    $('streams').append(s);
+    if (d.baud && rate / d.baud < 4) slow.push(`D${ch}`);
+  });
+  $('warn').textContent = slow.length ? `Sample rate too low for ${slow.join(', ')}: use at least 8× the baud rate.` : '';
+  const fr = allFrames(), list = $('frames');
+  list.innerHTML = '';
+  if (!fr.length) { list.innerHTML = '<div class="empty">No UART bytes in this capture. Check the wiring and ground, or raise the sample count.</div>'; return; }
+  for (const f of fr) {
+    const row = document.createElement('div');
+    row.innerHTML = `<span class="t">${fmtTime((f.start - t0()) / rate)}</span><span style="color:${COLORS[f.ch]}">D${f.ch}</span>
+      <span>${hex(f.byte)}</span><span>${esc(f.byte)}</span><span class="err">${f.ok ? '' : 'framing error'}</span>`;
+    row.onclick = () => {
+      view.spp = Math.max((f.end - f.start) / 80, 1 / 60);
+      view.start = (f.start + f.end) / 2 - W() / 2 * view.spp;
+      clampView(); draw();
+    };
+    list.append(row);
+  }
+}
+
+function dumpText() {
+  const lines = decoded.flatMap((d, ch) => d ? [`D${ch} @ ${d.baud ?? '?'} baud: ${d.frames.map(f => esc(f.byte)).join('')}`] : []);
+  lines.push('', 'time\tch\thex\tascii');
+  for (const f of allFrames()) lines.push(`${fmtTime((f.start - t0()) / rate)}\tD${f.ch}\t${hex(f.byte)}\t${esc(f.byte)}${f.ok ? '' : '\tframing error'}`);
+  return lines.join('\n');
+}
+$('copy').onclick = async () => {
+  try { await navigator.clipboard.writeText(dumpText()); $('copy').textContent = 'Copied'; }
+  catch { $('copy').textContent = 'Copy failed'; }
+  setTimeout(() => $('copy').textContent = 'Copy dump', 1500);
+};
 
 // ---- view ----
 const W = () => cv.clientWidth, H = () => cv.clientHeight;
@@ -210,7 +304,8 @@ function draw() {
   // waveforms
   const i0 = Math.max(0, Math.floor(iAt(0))), i1 = Math.min(data.length, Math.ceil(iAt(w)) + 1);
   for (let ch = 0; ch < 8; ch++) {
-    const y = ruler + ch * rowH, hi = y + rowH * 0.24, lo = y + rowH * 0.76, m = 1 << ch;
+    const y = ruler + ch * rowH, m = 1 << ch;
+    const [hi, lo] = decoded[ch] ? [y + rowH * 0.12, y + rowH * 0.5] : [y + rowH * 0.24, y + rowH * 0.76];
     ctx.fillStyle = COLORS[ch] + '1c';
     ctx.beginPath();
     let prev = data[i0] & m, runStart = i0;
@@ -228,6 +323,22 @@ function draw() {
     ctx.lineTo(xOf(i1), prev ? hi : lo);
     if (prev) highRun(runStart, i1);
     ctx.strokeStyle = COLORS[ch]; ctx.lineWidth = 1.5; ctx.lineJoin = 'miter'; ctx.stroke();
+
+    // decoded UART bytes in the band under the trace
+    if (!decoded[ch]) continue;
+    const by = y + rowH * 0.58, bh = rowH * 0.34;
+    ctx.font = `${Math.min(12, bh - 4)}px ` + C('--mono'); ctx.textAlign = 'center';
+    for (const f of decoded[ch].frames) {
+      const x0 = xOf(f.start), x1 = xOf(f.end);
+      if (x1 < 0 || x0 > w) continue;
+      const bw = Math.max(x1 - x0 - 1, 1);
+      ctx.fillStyle = f.ok ? COLORS[ch] + '33' : '#ff8a8f55';
+      ctx.fillRect(x0, by, bw, bh);
+      ctx.fillStyle = f.ok ? COLORS[ch] : '#ff8a8f'; ctx.fillRect(x0, by, 1, bh);
+      const label = bw > 58 ? `${hex(f.byte)} ${esc(f.byte)}` : bw > 22 ? hex(f.byte) : '';
+      if (label) { ctx.fillStyle = C('--fg'); ctx.fillText(label, x0 + bw / 2, by + bh / 2 + 1); }
+    }
+    ctx.textAlign = 'left';
   }
 
   // trigger, marker, cursor
@@ -296,15 +407,23 @@ new ResizeObserver(() => { clampView(); draw(); }).observe(cv);
 // ---- start ----
 if (tauri) refreshPorts().then(() => status('Ready.'));
 else {
-  // Demo signals so the viewer can be tried outside the app: a clock, an SPI-ish burst and a counter.
-  const n = 4096, d = new Uint8Array(n);
-  for (let i = 0; i < n; i++) {
-    const clk = (i >> 2) & 1, cs = i % 1024 > 200 && i % 1024 < 840 ? 0 : 1;
-    const sck = cs ? 0 : (i >> 3) & 1, mosi = cs ? 0 : (0xA5 >> ((i >> 4) & 7)) & 1;
-    d[i] = clk | cs << 1 | sck << 2 | mosi << 3 | ((i >> 7) & 0xf) << 4;
-  }
+  // Demo signals so the viewer can be tried outside the app: a UART exchange on D0/D1 at
+  // 115200 baud, a clock and a counter, sampled at 1 MHz.
+  const n = 16384, rateD = 1e6, spb = rateD / 115200, d = new Uint8Array(n).fill(3);
+  const tx = (ch, at, text) => [...text].forEach((c, j) => {
+    const b = c.charCodeAt(0), s = at + j * spb * 11;
+    for (let k = 0; k < 10; k++) {
+      const bit = k === 0 ? 0 : k === 9 ? 1 : (b >> (k - 1)) & 1;
+      for (let i = Math.round(s + k * spb); i < Math.round(s + (k + 1) * spb); i++) d[i] = bit ? d[i] | 1 << ch : d[i] & ~(1 << ch);
+    }
+  });
+  tx(0, 800, 'AT+GMR\r\n');
+  tx(1, 2600, 'AT version:1.7.4\r\nOK\r\n');
+  tx(0, 9000, 'AT+CWMODE=1\r\n');
+  tx(1, 11400, 'OK\r\n');
+  for (let i = 0; i < n; i++) d[i] = (d[i] & 3) | ((i >> 5) & 1) << 2 | ((i >> 9) & 0x1f) << 3;
   $('port').add(new Option('Demo data', ''));
-  show(d, 10e6, 1024);
+  show(d, rateD, null);
   status('Demo data: open in the Mojo LA app to capture.');
 }
 </script>

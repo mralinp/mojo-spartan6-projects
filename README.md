@@ -76,7 +76,13 @@ cd viewer/src-tauri && cargo run --release
 
 Pick the port, sample rate, sample count and how much to keep before the trigger, click a channel's chip to trigger
 on it (`X` don't care → `0` → `1`), and press **Capture**. Scroll to zoom, drag to pan, click to drop a marker and
-read the time and frequency to the cursor. `npx @tauri-apps/cli@2 build` in `viewer/src-tauri` makes a `.app` and
+read the time and frequency to the cursor.
+
+**Sniffing a UART:** wire the two lines to D0 and D1 and the grounds together; both channels decode as 8N1 UART
+by default (toggle with each channel's **UART** chip). The baud rate is detected from the pulse widths, or pick it.
+Bytes are labeled on the waveform, and the dump panel lists every byte with its time, hex and ASCII; click one to
+jump to it, or **Copy dump** for a text log. Sample at 8× the baud rate or more: 1 MHz with 16K samples covers
+16 ms, about 180 bytes at 115200. Decoder test: `node viewer/ui/uart.test.js`. `npx @tauri-apps/cli@2 build` in `viewer/src-tauri` makes a `.app` and
 `.dmg`. Opening `viewer/ui/index.html` in a browser shows the viewer with demo data.
 
 **Capture with PulseView:** pick the driver *Openbench Logic Sniffer & SUMP compatibles*, serial port
