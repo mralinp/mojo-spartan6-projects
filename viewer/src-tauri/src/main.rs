@@ -2,24 +2,44 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::io::{Read, Write};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const SUMP_CLOCK: u32 = 100_000_000; // SUMP dividers are relative to 100 MHz
+/// Rates the hardware hits exactly (they divide the Mojo's 50 MHz clock). Keep in sync with ui/index.html.
+const RATES: [u32; 12] = [
+    50_000_000, 25_000_000, 10_000_000, 5_000_000, 2_000_000, 1_000_000, 500_000, 200_000, 100_000,
+    50_000, 10_000, 1_000,
+];
+
+type Port = Box<dyn serialport::SerialPort>;
 
 fn long(cmd: u8, arg: u32) -> [u8; 5] {
     let a = arg.to_le_bytes();
     [cmd, a[0], a[1], a[2], a[3]]
 }
 
-/// SUMP setup for one capture. `samples` is a multiple of 4; `post` of them come after the trigger.
-fn setup(rate: u32, samples: u32, post: u32, mask: u8, value: u8) -> Vec<u8> {
-    let post = post.clamp(4, samples);
-    let size = (samples / 4 - 1) | ((post / 4 - 1) << 16);
+/// One capture's settings, as the UI sends them. `samples` is a multiple of 4; `post` of them come after the trigger.
+#[derive(serde::Deserialize, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+struct Settings {
+    rate: u32,
+    samples: u32,
+    post: u32,
+    mask: u8,
+    value: u8,
+    wait_ms: u64,
+}
+
+/// SUMP setup commands for one capture.
+fn setup(s: &Settings) -> Vec<u8> {
+    let post = s.post.clamp(4, s.samples);
+    let size = (s.samples / 4 - 1) | ((post / 4 - 1) << 16);
     [
-        long(0x80, SUMP_CLOCK / rate - 1),
+        long(0x80, SUMP_CLOCK / s.rate - 1),
         long(0x81, size),
-        long(0xC0, mask as u32),
-        long(0xC1, value as u32),
+        long(0xC0, s.mask as u32),
+        long(0xC1, s.value as u32),
     ]
     .concat()
 }
@@ -38,80 +58,208 @@ fn list_ports() -> Vec<String> {
     ports
 }
 
-fn run(
-    port: &str,
-    rate: u32,
-    samples: u32,
-    post: u32,
-    mask: u8,
-    value: u8,
-    wait_s: u64,
-) -> Result<Vec<u8>, String> {
-    let io = |e: std::io::Error| format!("{port}: {e}");
-    let mut p = serialport::new(port, 115_200)
+/// Opens `name` and checks that a logic analyzer answers.
+fn connect(name: &str) -> Result<Port, String> {
+    let io = |e: std::io::Error| format!("{name}: {e}");
+    let mut p = serialport::new(name, 115_200)
         .timeout(Duration::from_millis(300))
         .open()
-        .map_err(|e| format!("Can't open {port}: {e}"))?;
-
+        .map_err(|e| format!("Can't open {name}: {e}"))?;
     p.write_all(&[0; 5]).map_err(io)?; // reset, also aborts a capture left armed
     std::thread::sleep(Duration::from_millis(50));
     let _ = p.clear(serialport::ClearBuffer::Input);
-
     p.write_all(&[0x02]).map_err(io)?;
     let mut id = [0u8; 4];
     if p.read_exact(&mut id).is_err() || &id != b"1ALS" {
         return Err(format!(
-            "No logic analyzer answered on {port}. Is the logic_analyzer bitstream flashed?"
+            "No logic analyzer answered on {name}. Is the logic_analyzer bitstream flashed?"
         ));
     }
+    Ok(p)
+}
 
-    p.write_all(&setup(rate, samples, post, mask, value))
-        .map_err(io)?;
+/// One capture, oldest sample first. `None` when the trigger didn't fire within `wait_ms`.
+fn capture_on(p: &mut Port, s: &Settings) -> Result<Option<Vec<u8>>, String> {
+    let io = |e: std::io::Error| e.to_string();
+    let _ = p.clear(serialport::ClearBuffer::Input);
+    p.write_all(&setup(s)).map_err(io)?;
     p.write_all(&[0x01]).map_err(io)?;
 
-    let mut buf = vec![0u8; samples as usize];
+    let mut buf = vec![0u8; s.samples as usize];
     let mut got = 0;
-    let deadline = Instant::now() + Duration::from_secs(wait_s);
+    let deadline = Instant::now() + Duration::from_millis(s.wait_ms);
     while got < buf.len() {
         match p.read(&mut buf[got..]) {
             Ok(n) => got += n,
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
                 if Instant::now() > deadline {
-                    let _ = p.write_all(&[0; 5]);
-                    return Err(if got == 0 {
-                        format!("Trigger didn't fire within {wait_s} s.")
-                    } else {
-                        format!("Capture stopped after {got} of {samples} samples.")
-                    });
+                    if got > 0 {
+                        return Err(format!(
+                            "Capture stopped after {got} of {} samples.",
+                            s.samples
+                        ));
+                    }
+                    p.write_all(&[0; 5]).map_err(io)?; // disarm; drop anything that raced in
+                    std::thread::sleep(Duration::from_millis(20));
+                    let _ = p.clear(serialport::ClearBuffer::Input);
+                    return Ok(None);
                 }
             }
             Err(e) => return Err(io(e)),
         }
     }
     buf.reverse(); // SUMP sends newest first
-    Ok(buf)
+    Ok(Some(buf))
+}
+
+/// The open connection, kept between captures. Reopening the port toggles DTR,
+/// and five DTR drops within 250 ms send the Mojo's AVR into its loader.
+#[derive(Default, Clone)]
+struct Link(Arc<Mutex<Option<(String, Port)>>>);
+
+impl Link {
+    /// Runs `f` on an identified connection to `name`, (re)connecting when needed.
+    fn with<T>(
+        &self,
+        name: &str,
+        f: impl FnOnce(&mut Port) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut g = self.0.lock().unwrap();
+        if g.as_ref().is_none_or(|(n, _)| n != name) {
+            *g = None;
+            *g = Some((name.to_string(), connect(name)?));
+        }
+        let r = f(&mut g.as_mut().unwrap().1);
+        if r.is_err() {
+            *g = None; // reconnect and re-identify next time
+        }
+        r
+    }
+}
+
+/// Per-channel summary of a capture.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+struct Activity {
+    edges: usize,
+    /// The level the line spends most time at.
+    idle_high: bool,
+    /// Shortest complete pulse in samples (runs cut off by the capture's ends don't count).
+    min_run: Option<usize>,
+}
+
+fn activity(d: &[u8]) -> [Activity; 8] {
+    let mut out = [Activity::default(); 8];
+    for (ch, a) in out.iter_mut().enumerate() {
+        let bit = |i: usize| (d[i] >> ch) & 1;
+        let highs = (0..d.len()).filter(|&i| bit(i) == 1).count();
+        a.idle_high = highs * 2 > d.len();
+        let mut last_edge = None;
+        for i in 1..d.len() {
+            if bit(i) != bit(i - 1) {
+                a.edges += 1;
+                if let Some(l) = last_edge {
+                    let run = i - l;
+                    a.min_run = Some(a.min_run.map_or(run, |m: usize| m.min(run)));
+                }
+                last_edge = Some(i);
+            }
+        }
+    }
+    out
+}
+
+/// Slowest exact rate that still gives 10 samples per shortest pulse.
+fn pick_rate(pulse_s: f64) -> u32 {
+    let need = 10.0 / pulse_s;
+    RATES
+        .iter()
+        .rev()
+        .copied()
+        .find(|&r| r as f64 >= need)
+        .unwrap_or(RATES[0])
+}
+
+/// What Auto found and chose.
+#[derive(serde::Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct Setup {
+    rate: u32,
+    channel: u8,
+    idle_high: bool,
+    pulse_ns: f64,
+}
+
+fn autoset_on(p: &mut Port) -> Result<Setup, String> {
+    // 1. Which lines move, and where do they rest? 0.4 s at 10 kHz.
+    // ponytail: a lone pulse shorter than 100 µs can slip between these samples; a faster second look would catch it
+    let look = Settings {
+        rate: 10_000,
+        samples: 4096,
+        post: 4096,
+        mask: 0,
+        value: 0,
+        wait_ms: 2000,
+    };
+    let d = capture_on(p, &look)?.ok_or("The analyzer didn't answer.")?;
+    let a = activity(&d);
+    let ch = (0..8).max_by_key(|&c| a[c].edges).unwrap();
+    if a[ch].edges == 0 {
+        return Err(
+            "No activity on any probe for 0.4 s. Check the wiring and the shared ground.".into(),
+        );
+    }
+    let idle_high = a[ch].idle_high;
+    let mask = 1u8 << ch;
+
+    // 2. Shortest pulse: trigger on that line leaving idle, fastest rate first, until a whole pulse fits.
+    for rate in [50_000_000, 5_000_000, 500_000, 50_000, 10_000] {
+        let s = Settings {
+            rate,
+            samples: 4096,
+            post: 3688,
+            mask,
+            value: if idle_high { 0 } else { mask },
+            wait_ms: 3000,
+        };
+        let d =
+            capture_on(p, &s)?.ok_or(format!("D{ch} went quiet before it could be measured."))?;
+        if let Some(run) = activity(&d).iter().filter_map(|a| a.min_run).min() {
+            let pulse = run as f64 / rate as f64;
+            return Ok(Setup {
+                rate: pick_rate(pulse),
+                channel: ch as u8,
+                idle_high,
+                pulse_ns: pulse * 1e9,
+            });
+        }
+    }
+    Err(format!("D{ch} toggles too rarely to measure a pulse."))
 }
 
 #[tauri::command]
 async fn capture(
+    link: tauri::State<'_, Link>,
     port: String,
-    rate: u32,
-    samples: u32,
-    post: u32,
-    mask: u8,
-    value: u8,
-    wait_s: u64,
-) -> Result<Vec<u8>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        run(&port, rate, samples, post, mask, value, wait_s)
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    s: Settings,
+) -> Result<Option<Vec<u8>>, String> {
+    let link = link.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || link.with(&port, |p| capture_on(p, &s)))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn autoset(link: tauri::State<'_, Link>, port: String) -> Result<Setup, String> {
+    let link = link.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || link.with(&port, autoset_on))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 fn main() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![list_ports, capture])
+        .manage(Link::default())
+        .invoke_handler(tauri::generate_handler![list_ports, capture, autoset])
         .run(tauri::generate_context!())
         .expect("error while running Mojo LA");
 }
@@ -120,26 +268,109 @@ fn main() {
 mod tests {
     use super::*;
 
+    fn settings(rate: u32, samples: u32, post: u32, mask: u8, value: u8) -> Settings {
+        Settings {
+            rate,
+            samples,
+            post,
+            mask,
+            value,
+            wait_ms: 5000,
+        }
+    }
+
     #[test]
     fn setup_bytes() {
         // 1 MHz, 16K samples, 4K after the trigger, trigger on D0 high
-        let b = setup(1_000_000, 16384, 4096, 0x01, 0x01);
+        let b = setup(&settings(1_000_000, 16384, 4096, 0x01, 0x01));
         assert_eq!(&b[0..5], &[0x80, 99, 0, 0, 0]);
         assert_eq!(&b[5..10], &[0x81, 0xFF, 0x0F, 0xFF, 0x03]);
         assert_eq!(&b[10..20], &[0xC0, 1, 0, 0, 0, 0xC1, 1, 0, 0, 0]);
         // post is clamped to the 4..=samples range the hardware counts in
         assert_eq!(
-            &setup(50_000_000, 1024, 0, 0, 0)[5..10],
+            &setup(&settings(50_000_000, 1024, 0, 0, 0))[5..10],
             &[0x81, 0xFF, 0x00, 0x00, 0x00]
         );
     }
 
-    /// Needs a Mojo with the logic_analyzer bitstream: cargo test -- --ignored
+    #[test]
+    fn activity_summary() {
+        // D0: idle high with a 3-sample low pulse and a 5-sample low pulse; D1: flat low
+        let d: Vec<u8> = "1111000111110000011111".bytes().map(|c| c - b'0').collect();
+        let a = activity(&d);
+        assert_eq!(
+            a[0],
+            Activity {
+                edges: 4,
+                idle_high: true,
+                min_run: Some(3)
+            }
+        );
+        assert_eq!(
+            a[1],
+            Activity {
+                edges: 0,
+                idle_high: false,
+                min_run: None
+            }
+        );
+        // a run cut off by the capture's end isn't a pulse
+        assert_eq!(activity(&[1, 1, 0, 0])[0].min_run, None);
+    }
+
+    #[test]
+    fn rate_choice() {
+        assert_eq!(pick_rate(1.0 / 115_200.0), 2_000_000); // UART bit 8.7 µs -> 10 samples needs 1.15 MHz
+        assert_eq!(pick_rate(1e-6), 10_000_000);
+        assert_eq!(pick_rate(10e-9), 50_000_000); // faster than we can sample: best we have
+        assert_eq!(pick_rate(1.0), 1_000);
+    }
+
+    // Need a Mojo with the logic_analyzer bitstream: cargo test -- --ignored
+    fn board() -> Link {
+        Link::default()
+    }
+    fn port() -> String {
+        list_ports().into_iter().next().expect("no serial port")
+    }
+
     #[test]
     #[ignore]
     fn board_capture() {
-        let port = list_ports().into_iter().next().expect("no serial port");
-        let d = run(&port, 1_000_000, 16384, 16384, 0, 0, 5).unwrap();
-        assert_eq!(d.len(), 16384);
+        let d = board().with(&port(), |p| {
+            capture_on(p, &settings(1_000_000, 16384, 16384, 0, 0))
+        });
+        assert_eq!(d.unwrap().unwrap().len(), 16384);
+    }
+
+    /// 30 back-to-back captures on one connection: the analyzer must still answer afterwards.
+    #[test]
+    #[ignore]
+    fn board_live() {
+        let link = board();
+        let t = Instant::now();
+        for _ in 0..30 {
+            let d = link.with(&port(), |p| {
+                capture_on(p, &settings(1_000_000, 1024, 1024, 0, 0))
+            });
+            assert_eq!(d.unwrap().unwrap().len(), 1024);
+        }
+        println!("30 captures of 1K in {:.2} s", t.elapsed().as_secs_f64());
+        drop(link); // the port is exclusive: close it before checking with a fresh connection
+        assert!(connect(&port()).is_ok());
+    }
+
+    /// With the Pro Micro UART rig wired up: Auto should find the 115200-baud line.
+    #[test]
+    #[ignore]
+    fn board_autoset() {
+        let s = board().with(&port(), autoset_on).unwrap();
+        println!("{s:?}");
+        assert_eq!(s.rate, 2_000_000);
+        assert!(s.idle_high);
+        assert!(
+            (8_000.0..9_500.0).contains(&s.pulse_ns),
+            "one bit at 115200 is 8.68 µs"
+        );
     }
 }

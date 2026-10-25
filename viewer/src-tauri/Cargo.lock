@@ -1825,6 +1825,7 @@ dependencies = [
 name = "mojo-la"
 version = "0.0.0"
 dependencies = [
+ "serde",
  "serialport",
  "tauri",
  "tauri-build",

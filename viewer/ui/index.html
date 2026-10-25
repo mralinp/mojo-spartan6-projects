@@ -30,7 +30,13 @@
   button.icon { padding: 5px 8px; }
   #capture { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; padding: 8px 18px; margin-left: 4px; }
   #capture:hover { background: var(--accent-hi); }
-  #capture:disabled { opacity: .55; cursor: progress; }
+  #capture:disabled, #auto:disabled, #run:disabled { opacity: .55; cursor: progress; }
+  .actions { display: flex; gap: 6px; align-items: center; }
+  #auto, #run { padding: 8px 14px; font-weight: 600; }
+  #run[aria-pressed="true"] { border-color: var(--accent-hi); color: #fff; }
+  #run[aria-pressed="true"]::before { content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 7px; border-radius: 50%; background: var(--accent-hi); vertical-align: 1px; animation: blink 1s steps(2) infinite; }
+  @keyframes blink { 50% { opacity: .2; } }
+  @media (prefers-reduced-motion: reduce) { #run[aria-pressed="true"]::before { animation: none; } }
   #status { margin-left: auto; color: var(--dim); max-width: 46ch; text-align: right; }
   #status.err { color: #ff8a8f; }
 
@@ -81,7 +87,11 @@
   <label class="field">Samples <select id="samples"></select></label>
   <label class="field">Before trigger <select id="pre"></select></label>
   <label class="field">UART baud <select id="baud"></select></label>
-  <button id="capture">Capture</button>
+  <div class="actions">
+    <button id="auto" title="Find the active signal and set the sample rate and trigger (A)">Auto</button>
+    <button id="run" aria-pressed="false" title="Capture continuously (Space)">Run</button>
+    <button id="capture" title="One capture (Enter)">Capture</button>
+  </div>
   <div id="status"></div>
 </header>
 
@@ -106,7 +116,7 @@
   <span>value <b id="r-val">–</b></span>
   <span id="r-delta-wrap">Δ <b id="r-delta">click to set a marker</b></span>
   <span>view <b id="r-span">–</b></span>
-  <span class="keys"><kbd>scroll</kbd> zoom · <kbd>drag</kbd> pan · <kbd>F</kbd> fit · <kbd>Enter</kbd> capture · <kbd>Esc</kbd> clear marker</span>
+  <span class="keys"><kbd>scroll</kbd> zoom · <kbd>drag</kbd> pan · <kbd>F</kbd> fit · <kbd>A</kbd> auto · <kbd>Space</kbd> run/stop · <kbd>Enter</kbd> capture · <kbd>Esc</kbd> clear marker</span>
 </footer>
 
 <script src="uart.js"></script>
@@ -117,7 +127,8 @@ const COLORS = ['#a3a9b2', '#c08a5c', '#ef4f57', '#f2913f', '#f2cc4c', '#4cb764'
 const RATES = [50e6, 25e6, 10e6, 5e6, 2e6, 1e6, 500e3, 200e3, 100e3, 50e3, 10e3, 1e3];
 const SIZES = [1024, 2048, 4096, 8192, 16384];
 const PRE = [10, 25, 50, 75, 90];
-const TRIGGER_WAIT_S = 20;
+const TRIGGER_WAIT_MS = 20000;            // single capture: wait this long for the trigger
+const LIVE_WAIT_MS = 1000;                // live: give up on a trigger after this, then rearm
 
 const tauri = window.__TAURI__;
 const $ = id => document.getElementById(id);
@@ -127,6 +138,8 @@ let data = null, rate = 1e6, trigIdx = null;
 let view = { start: 0, spp: 1 };          // first visible sample, samples per CSS pixel
 let hoverX = null, marker = null;
 const trig = Array(8).fill('X');          // per channel: X (don't care), 0, 1
+const trigBtns = [];
+let running = false;                      // live mode
 const uartOn = [true, true, false, false, false, false, false, false];
 let decoded = [];                         // per channel: {baud, frames} or null
 
@@ -151,12 +164,15 @@ for (let ch = 0; ch < 8; ch++) {
     <button class="uart" aria-pressed="${uartOn[ch]}" title="Decode D${ch} as UART">UART</button>
     <button class="trig" data-v="X" title="Trigger on D${ch}: don't care, low or high">X</button>`;
   const b = row.querySelector('.trig'), u = row.querySelector('.uart');
-  b.onclick = () => { trig[ch] = { X: '0', 0: '1', 1: 'X' }[trig[ch]]; b.dataset.v = b.textContent = trig[ch]; };
+  trigBtns[ch] = b;
+  b.onclick = () => setTrig(ch, { X: '0', 0: '1', 1: 'X' }[trig[ch]]);
   u.onclick = () => { uartOn[ch] = !uartOn[ch]; u.setAttribute('aria-pressed', uartOn[ch]); decode(); draw(); };
   $('gutter').append(row);
 }
 
+function setTrig(ch, v) { trig[ch] = v; trigBtns[ch].dataset.v = trigBtns[ch].textContent = v; }
 function status(msg, err = false) { $('status').textContent = msg; $('status').className = err ? 'err' : ''; }
+function busy(on) { $('capture').disabled = $('auto').disabled = on; $('run').disabled = on && !running; }
 
 async function refreshPorts() {
   if (!tauri) return;
@@ -167,29 +183,93 @@ async function refreshPorts() {
   if (!ports.length) sel.add(new Option('No serial ports found', ''));
 }
 
-async function capture() {
-  if (!tauri) return status('Captures need the Mojo LA app; this is demo data.', true);
+/** The current settings as a capture request, or null (with the reason shown) when we can't capture. */
+function request(waitMs) {
+  if (!tauri) { status('Captures need the Mojo LA app; this is demo data.', true); return null; }
   const port = $('port').value;
-  if (!port) return status('Plug in the Mojo, then press ↻ to find its port.', true);
+  if (!port) { status('Plug in the Mojo, then press ↻ to find its port.', true); return null; }
   const samples = +$('samples').value, r = +$('rate').value;
   let mask = 0, value = 0;
   trig.forEach((t, ch) => { if (t !== 'X') { mask |= 1 << ch; if (t === '1') value |= 1 << ch; } });
   // With no trigger, keep every sample after arming so none are stale.
   const post = mask ? Math.max(4, Math.round(samples * (100 - +$('pre').value) / 400) * 4) : samples;
-  $('capture').disabled = true;
-  status(mask ? 'Waiting for trigger…' : 'Capturing…');
+  return { port, s: { rate: r, samples, post, mask, value, waitMs }, trigIdx: mask ? samples - 1 - post : null };
+}
+const summary = req => `${req.s.samples.toLocaleString()} samples at ${fmtHz(req.s.rate)} · ${fmtTime(req.s.samples / req.s.rate)}`;
+
+async function capture(note = '') {
+  const req = request(TRIGGER_WAIT_MS);
+  if (!req) return;
+  busy(true);
+  status(req.s.mask ? 'Waiting for trigger…' : 'Capturing…');
   try {
-    const bytes = await tauri.core.invoke('capture', { port, rate: r, samples, post, mask, value, waitS: TRIGGER_WAIT_S });
-    show(Uint8Array.from(bytes), r, mask ? samples - 1 - post : null);
-    status(`${samples.toLocaleString()} samples at ${fmtHz(r)} · ${fmtTime(samples / r)}`);
+    const bytes = await tauri.core.invoke('capture', { port: req.port, s: req.s });
+    if (!bytes) status(`Trigger didn't fire within ${TRIGGER_WAIT_MS / 1000} s.`, true);
+    else { show(Uint8Array.from(bytes), req.s.rate, req.trigIdx); status(note + summary(req)); }
   } catch (e) {
     status(String(e), true);
   } finally {
-    $('capture').disabled = false;
+    busy(false);
   }
 }
 
-function show(d, r, t) { data = d; rate = r; trigIdx = t; marker = null; decode(); fit(); }
+/** Live mode: capture again and again, redrawing in place. Settings may change while it runs. */
+async function run() {
+  if (running) { running = false; $('run').disabled = true; return; } // stops after the capture in flight
+  if (!request(LIVE_WAIT_MS)) return;
+  running = true; busy(true);
+  $('run').setAttribute('aria-pressed', 'true'); $('run').textContent = 'Stop';
+  let frames = 0, fresh = true;
+  const t0 = performance.now();
+  while (running) {
+    const req = request(LIVE_WAIT_MS);
+    if (!req) break;
+    try {
+      const bytes = await tauri.core.invoke('capture', { port: req.port, s: req.s });
+      if (!running) break;
+      if (!bytes) { status('Live · waiting for trigger…'); continue; }
+      // keep the user's zoom and marker once there's a frame of the same shape to compare against
+      const keep = !fresh && data?.length === bytes.length && rate === req.s.rate;
+      show(Uint8Array.from(bytes), req.s.rate, req.trigIdx, keep);
+      fresh = false; frames++;
+      status(`Live · ${frames} captures · ${(frames * 1000 / (performance.now() - t0)).toFixed(1)}/s · ${summary(req)}`);
+    } catch (e) {
+      status(String(e), true);
+      break;
+    }
+  }
+  running = false; busy(false);
+  $('run').setAttribute('aria-pressed', 'false'); $('run').textContent = 'Run';
+}
+
+/** Oscilloscope-style Auto: find the active line, pick a rate and a trigger, then capture. */
+async function auto() {
+  if (!tauri) return status('Auto needs the Mojo LA app; this is demo data.', true);
+  const port = $('port').value;
+  if (!port) return status('Plug in the Mojo, then press ↻ to find its port.', true);
+  busy(true);
+  status('Auto: looking for activity…');
+  let s;
+  try {
+    s = await tauri.core.invoke('autoset', { port });
+  } catch (e) {
+    busy(false);
+    return status(String(e), true);
+  }
+  busy(false);
+  $('rate').value = s.rate;
+  trig.forEach((_, ch) => setTrig(ch, 'X'));
+  setTrig(s.channel, s.idleHigh ? '0' : '1');
+  $('pre').value = 10;
+  await capture(`Auto: D${s.channel} rests ${s.idleHigh ? 'high' : 'low'}, shortest pulse ${fmtTime(s.pulseNs / 1e9)} → `);
+}
+
+function show(d, r, t, keepView = false) {
+  data = d; rate = r; trigIdx = t;
+  if (!keepView) marker = null;
+  decode();
+  if (keepView) { clampView(); draw(); } else autoView();
+}
 
 // ---- UART ----
 const esc = b => b === 10 ? '\\n' : b === 13 ? '\\r' : b === 9 ? '\\t' : b >= 32 && b < 127 ? String.fromCharCode(b) : '·';
@@ -254,6 +334,35 @@ $('copy').onclick = async () => {
 // ---- view ----
 const W = () => cv.clientWidth, H = () => cv.clientHeight;
 function fit() { if (data) { view.spp = data.length / W(); view.start = 0; } draw(); }
+
+/** Zoom to where the data begins (the trigger, else the first edge) through the end of that first burst.
+ *  With UART bytes decoded, the first message is the burst, so a free-running clock on another line doesn't win. */
+function autoView() {
+  if (!data) return draw();
+  const fr = allFrames().filter(f => trigIdx === null || f.end > trigIdx);
+  if (fr.length) {
+    let last = fr[0];
+    for (const f of fr) if (f.start - last.end < (last.end - last.start) * 3) last = f; else break;
+    return zoomTo(Math.min(trigIdx ?? fr[0].start, fr[0].start), last.end);
+  }
+  const edges = [];
+  for (let i = 1; i < data.length; i++) if (data[i] !== data[i - 1]) edges.push(i);
+  const a = trigIdx ?? edges[0];
+  const k = edges.findIndex(e => e >= a);
+  if (a === undefined || k < 0) return fit();
+  // a burst ends at the first quiet gap longer than 20 typical edge spacings
+  const gaps = edges.slice(k + 1, k + 65).map((e, j) => e - edges[k + j]).sort((x, y) => x - y);
+  const typical = gaps.length ? gaps[gaps.length >> 1] : 1;
+  let b = edges[k];
+  for (let j = k + 1; j < edges.length && edges[j] - b <= typical * 20; j++) b = edges[j];
+  zoomTo(a, b);
+}
+function zoomTo(a, b) {
+  const span = Math.max(b - a, 40), pad = span * 0.08;
+  view.spp = (span + 2 * pad) / W();
+  view.start = a - pad;
+  clampView(); draw();
+}
 function clampView() {
   if (!data) return;
   view.spp = Math.min(Math.max(view.spp, 1 / 60), data.length / W());
@@ -395,12 +504,16 @@ cv.addEventListener('pointerup', e => {
 });
 cv.addEventListener('pointerleave', () => { hoverX = null; draw(); });
 addEventListener('keydown', e => {
-  if (e.target.tagName === 'SELECT') return;
+  if (e.target.tagName === 'SELECT' || e.target.tagName === 'BUTTON' && (e.key === 'Enter' || e.key === ' ')) return;
   if (e.key === 'f' || e.key === 'F') fit();
   else if (e.key === 'Enter' && !$('capture').disabled) capture();
+  else if (e.key === ' ' && !$('run').disabled) { e.preventDefault(); run(); }
+  else if ((e.key === 'a' || e.key === 'A') && !$('auto').disabled) auto();
   else if (e.key === 'Escape') { marker = null; $('r-delta').textContent = 'click to set a marker'; draw(); }
 });
-$('capture').onclick = capture;
+$('capture').onclick = () => capture();
+$('run').onclick = run;
+$('auto').onclick = auto;
 $('refresh').onclick = refreshPorts;
 new ResizeObserver(() => { clampView(); draw(); }).observe(cv);
 
