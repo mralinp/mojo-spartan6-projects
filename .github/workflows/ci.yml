@@ -51,6 +51,24 @@ jobs:
         working-directory: .
         run: .github/scripts/test.sh
 
+  examples:
+    name: Arduino examples compile
+    # Linux: the AVR toolchain ships x86-only for macOS
+    runs-on: ubuntu-latest
+    env:
+      SPARKFUN: https://raw.githubusercontent.com/sparkfun/Arduino_Boards/main/IDE_Board_Manager/package_sparkfun_index.json
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-arduino-cli@v2
+      - run: |
+          arduino-cli core update-index --additional-urls "$SPARKFUN"
+          arduino-cli core install arduino:avr SparkFun:avr --additional-urls "$SPARKFUN"
+      - name: Pro Micro 5 V / 16 MHz and 3.3 V / 8 MHz
+        run: |
+          for b in arduino:avr:leonardo SparkFun:avr:promicro:cpu=8MHzatmega32U4; do
+            arduino-cli compile --fqbn "$b" --additional-urls "$SPARKFUN" examples/pro_micro_uart
+          done
+
   pr-title:
     name: PR title is a Conventional Commit
     if: github.event_name == 'pull_request'
