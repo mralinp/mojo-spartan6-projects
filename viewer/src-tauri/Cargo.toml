@@ -9,3 +9,4 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 serialport = "4"
+serde = { version = "1.0.229", features = ["derive"] }
