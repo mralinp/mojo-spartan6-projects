@@ -37,6 +37,7 @@ jobs:
         run: |
           node ../ui/uart.test.js
           node ../ui/measure.test.js
+          node ../ui/buses.test.js
       - name: logic analyzer testbench
         working-directory: logic_analyzer
         run: |
@@ -67,8 +68,10 @@ jobs:
           arduino-cli core install arduino:avr SparkFun:avr --additional-urls "$SPARKFUN"
       - name: Pro Micro 5 V / 16 MHz and 3.3 V / 8 MHz
         run: |
-          for b in arduino:avr:leonardo SparkFun:avr:promicro:cpu=8MHzatmega32U4; do
-            arduino-cli compile --fqbn "$b" --additional-urls "$SPARKFUN" examples/pro_micro_uart
+          for sketch in examples/*/; do
+            for b in arduino:avr:leonardo SparkFun:avr:promicro:cpu=8MHzatmega32U4; do
+              arduino-cli compile --fqbn "$b" --additional-urls "$SPARKFUN" "$sketch"
+            done
           done
 
   pr-title:

@@ -59,14 +59,21 @@
   .uart[aria-pressed="true"] { color: var(--bg); background: var(--fg); border-color: var(--fg); }
   .plot { position: relative; min-width: 0; }
 
-  #panel { border-top: 1px solid var(--line); background: var(--panel); display: grid; grid-template-rows: auto 1fr; height: 210px; min-height: 0; }
+  #panel { border-top: 1px solid var(--line); background: var(--panel); display: grid; grid-template-rows: auto 1fr; height: 250px; min-height: 0; }
   .tabs { display: flex; align-items: center; gap: 4px; padding: 4px 10px 0; border-bottom: 1px solid var(--line); }
   .tabs [role="tab"] { font: 600 10px var(--ui); text-transform: uppercase; letter-spacing: .08em; color: var(--dim);
     background: none; border: 0; border-bottom: 2px solid transparent; border-radius: 0; padding: 6px 8px; }
   .tabs [role="tab"][aria-selected="true"] { color: var(--fg); border-bottom-color: var(--accent-hi); }
   .tabs .scope { margin-left: auto; font-size: 11px; color: var(--dim); display: flex; align-items: center; gap: 6px; }
   .tabs .scope select { font-size: 11px; padding: 2px 6px; }
-  #dump { display: grid; grid-template-rows: auto 1fr; min-height: 0; }
+  #dump { display: grid; grid-template-rows: auto auto 1fr; min-height: 0; }
+  #dump .bar button { font-size: 12px; padding: 3px 10px; }
+  #buses:empty { display: none; }
+  #buses { display: flex; flex-direction: column; gap: 4px; padding: 6px 14px; border-bottom: 1px solid var(--line); }
+  .bus { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; font-size: 12px; color: var(--dim); }
+  .bus b { color: var(--fg); font: 600 12px var(--mono); min-width: 32px; }
+  .bus select { font-size: 12px; padding: 2px 4px; }
+  .bus .rm { margin-left: auto; padding: 1px 8px; }
   #measure { overflow: auto; min-height: 0; }
   #measure table { border-collapse: collapse; width: 100%; font: 12px/1.6 var(--mono); font-variant-numeric: tabular-nums; }
   #measure th { position: sticky; top: 0; background: var(--panel); font: 600 10px var(--ui); text-transform: uppercase;
@@ -79,12 +86,14 @@
   #dump h2 { font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); margin: 0; font-weight: 600; }
   #streams { display: flex; gap: 18px; flex: 1; min-width: 0; font: 12px var(--mono); }
   #streams span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  #streams { flex-wrap: wrap; row-gap: 2px; }
   #warn { color: #f2cc4c; font-size: 12px; }
   #copy { font-size: 12px; padding: 3px 10px; }
   #frames { overflow: auto; font: 12px/1.7 var(--mono); padding: 4px 0; font-variant-numeric: tabular-nums; }
   #frames div { display: grid; grid-template-columns: 110px minmax(34px, 12ch) 34px 60px 1fr; gap: 8px; padding: 0 14px; cursor: pointer; }
   #frames div:hover { background: var(--grid); }
   #frames .t { color: var(--dim); text-align: right; }
+  #frames .note { color: var(--dim); }
   #frames .c { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #frames .err { color: #ff8a8f; }
   #frames .empty { cursor: default; color: var(--dim); font-family: var(--ui); display: block; }
@@ -126,7 +135,7 @@
 <section id="panel" hidden>
   <div class="tabs" role="tablist">
     <button role="tab" id="tab-measure" aria-selected="true" aria-controls="measure">Measurements</button>
-    <button role="tab" id="tab-dump" aria-selected="false" aria-controls="dump">UART dump</button>
+    <button role="tab" id="tab-dump" aria-selected="false" aria-controls="dump">Decoded</button>
     <label class="scope" id="scope-wrap">Over <select id="scope"><option value="all">whole capture</option><option value="view">visible window</option></select></label>
   </div>
   <div id="measure" role="tabpanel" aria-labelledby="tab-measure">
@@ -139,8 +148,11 @@
     <div class="bar">
       <div id="streams"></div>
       <span id="warn"></span>
+      <button id="add-i2c" title="Decode an I²C bus">+ I²C</button>
+      <button id="add-spi" title="Decode an SPI bus">+ SPI</button>
       <button id="copy">Copy dump</button>
     </div>
+    <div id="buses"></div>
     <div id="frames"></div>
   </div>
 </section>
@@ -156,6 +168,7 @@
 
 <script src="uart.js"></script>
 <script src="measure.js"></script>
+<script src="buses.js"></script>
 <script>
 // Probe-lead colours, as on Saleae/sigrok harnesses: black, brown, red, orange, yellow, green, blue, violet.
 const COLORS = ['#a3a9b2', '#c08a5c', '#ef4f57', '#f2913f', '#f2cc4c', '#4cb764', '#4c96f7', '#a77ce6'];
@@ -184,7 +197,14 @@ const label = ch => names[ch] || `D${ch}`;
 function saveNames() { try { localStorage.setItem(NAMES_KEY, JSON.stringify(names)); } catch {} }
 let running = false;                      // live mode
 const uartOn = [true, true, false, false, false, false, false, false];
-let decoded = [];                         // per channel: {baud, frames} or null
+// Decoded bytes from every decoder (UART per channel, I²C and SPI per bus), in time order:
+// {start, end, ch (row it's drawn on), byte, long, short, note, bad, listed}
+let items = [], marks = [], summaries = [], slowLines = [];   // marks: I²C start/stop tags
+const BUSES_KEY = 'mojo-la.buses';
+const buses = (() => { try { const b = JSON.parse(localStorage.getItem(BUSES_KEY)); if (Array.isArray(b)) return b; } catch {} return []; })();
+function saveBuses() { try { localStorage.setItem(BUSES_KEY, JSON.stringify(buses)); } catch {} }
+/** Rows that get a label band under the trace: UART channels and the data lines of each bus. */
+const decodedRow = ch => uartOn[ch] || buses.some(b => b.type === 'i2c' ? b.sda === ch : b.mosi === ch || b.miso === ch);
 
 const fmtHz = f => { const [d, u] = f >= 1e6 ? [1e6, 'MHz'] : f >= 1e3 ? [1e3, 'kHz'] : [1, 'Hz']; return +(f / d).toPrecision(4) + ' ' + u; };
 function fmtTime(s) {
@@ -222,7 +242,7 @@ for (let ch = 0; ch < 8; ch++) {
     const finish = keep => {
       if (done) return; done = true;
       if (keep) { names[ch] = input.value.trim(); saveNames(); }
-      input.replaceWith(nm); showName(); renderDump(); renderMeasure(true); nm.focus();
+      input.replaceWith(nm); showName(); renderBuses(); renderDump(); renderMeasure(true); nm.focus();
     };
     // preventDefault: otherwise this Enter also clicks the name button that gets focus back, reopening the editor
     input.onkeydown = e => {
@@ -385,49 +405,80 @@ $('tab-measure').onclick = () => selectTab('measure');
 $('tab-dump').onclick = () => selectTab('dump');
 $('scope').onchange = () => renderMeasure(true);
 
-// ---- UART ----
+// ---- decoding ----
 const esc = b => b === 10 ? '\\n' : b === 13 ? '\\r' : b === 9 ? '\\t' : b >= 32 && b < 127 ? String.fromCharCode(b) : '·';
 const hex = b => b.toString(16).padStart(2, '0').toUpperCase();
+const byteItem = (start, end, ch, byte, note = '', bad = false) =>
+  ({ start, end, ch, byte, long: `${hex(byte)} ${esc(byte)}`, short: hex(byte), chr: esc(byte), note, bad, listed: true });
 
 function decode() {
-  decoded = uartOn.map((on, ch) => {
-    if (!on || !data) return null;
-    const baud = +$('baud').value || guessBaud(data, ch, rate);
-    return baud ? { baud, frames: decodeUart(data, ch, rate, baud) } : { baud: null, frames: [] };
-  });
+  items = []; marks = []; summaries = []; slowLines = [];
+  if (data) {
+    uartOn.forEach((on, ch) => {
+      if (!on) return;
+      const baud = +$('baud').value || guessBaud(data, ch, rate);
+      const frames = baud ? decodeUart(data, ch, rate, baud) : [];
+      for (const f of frames) items.push(byteItem(f.start, f.end, ch, f.byte, f.ok ? '' : 'framing error', !f.ok));
+      summaries.push({ ch, what: baud ? `UART ${baud.toLocaleString()} baud` : 'UART idle', text: frames.map(f => esc(f.byte)).join('') });
+      if (baud && rate / baud < 4) slowLines.push(label(ch));
+    });
+    for (const b of buses) {
+      if (b.type === 'i2c') {
+        const parts = [];
+        let open = false;                         // S start, Sr repeated start, P stop: the usual I²C notation
+        for (const e of decodeI2C(data, b.scl, b.sda)) {
+          if (e.type === 'start' || e.type === 'stop') {
+            marks.push({ at: e.at, ch: b.sda, text: e.type === 'start' ? 'S' : 'P' });
+            parts.push(e.type === 'stop' ? 'P' : open ? 'Sr' : 'S');
+            open = e.type === 'start';
+          } else if (e.type === 'addr') {
+            const rw = e.read ? 'R' : 'W';
+            items.push({ start: e.start, end: e.end, ch: b.sda, byte: e.addr, long: `${hex(e.addr)} ${rw}${e.ack ? '' : ' NACK'}`,
+              short: hex(e.addr), chr: '', note: `address ${e.read ? 'read' : 'write'}, ${e.ack ? 'ACK' : 'NACK'}`, bad: !e.ack, listed: true });
+            parts.push(`${hex(e.addr)}${rw}${e.ack ? '' : '!'}`);
+          } else {
+            items.push(byteItem(e.start, e.end, b.sda, e.byte, e.ack ? 'ACK' : 'NACK'));
+            parts.push(hex(e.byte));
+          }
+        }
+        summaries.push({ ch: b.sda, what: 'I²C', text: parts.join(' ') || '–' });
+      } else {
+        const bytes = decodeSPI(data, b), mo = [], mi = [];
+        for (const x of bytes) {
+          if (x.mosi !== null) { items.push(byteItem(x.start, x.end, b.mosi, x.mosi, x.miso !== null ? `MISO ${hex(x.miso)}` : '')); mo.push(hex(x.mosi)); }
+          if (x.miso !== null) { items.push({ ...byteItem(x.start, x.end, b.miso, x.miso, 'MISO'), listed: x.mosi === null }); mi.push(hex(x.miso)); }
+        }
+        summaries.push({ ch: b.mosi >= 0 ? b.mosi : b.miso, what: `SPI mode ${b.mode}`,
+          text: [mo.length && `MOSI ${mo.join(' ')}`, mi.length && `MISO ${mi.join(' ')}`].filter(Boolean).join(' · ') || '–' });
+      }
+    }
+  }
+  items.sort((a, b) => a.start - b.start);
   renderDump();
-}
-
-function allFrames() {
-  return decoded.flatMap((d, ch) => d ? d.frames.map(f => ({ ...f, ch })) : []).sort((a, b) => a.start - b.start);
 }
 
 function renderDump() {
   $('streams').innerHTML = '';
-  if (!decoded.some(Boolean)) {
-    $('warn').textContent = '';
-    $('frames').innerHTML = '<div class="empty">Turn on a channel\'s UART chip to decode it.</div>';
-    return;
-  }
-  const slow = [];
-  decoded.forEach((d, ch) => {
-    if (!d) return;
+  $('warn').textContent = slowLines.length ? `Sample rate too low for ${slowLines.join(', ')}: use at least 8× the baud rate.` : '';
+  for (const sm of summaries) {
     const s = document.createElement('span');
-    s.innerHTML = `<b style="color:${COLORS[ch]}"></b> ${d.baud ? d.baud.toLocaleString() + ' baud' : 'idle'}: `;
-    s.querySelector('b').textContent = label(ch); // names are user text: never innerHTML
-    s.append(d.frames.map(f => esc(f.byte)).join('') || '–');
+    s.innerHTML = `<b style="color:${COLORS[sm.ch] ?? 'inherit'}"></b> `;
+    s.querySelector('b').textContent = `${sm.ch >= 0 ? label(sm.ch) : ''} ${sm.what}:`; // names are user text: never innerHTML
+    s.append(' ' + (sm.text || '–'));
     $('streams').append(s);
-    if (d.baud && rate / d.baud < 4) slow.push(label(ch));
-  });
-  $('warn').textContent = slow.length ? `Sample rate too low for ${slow.join(', ')}: use at least 8× the baud rate.` : '';
-  const fr = allFrames(), list = $('frames');
+  }
+  const list = $('frames');
   list.innerHTML = '';
-  if (!fr.length) { list.innerHTML = '<div class="empty">No UART bytes in this capture. Check the wiring and ground, or raise the sample count.</div>'; return; }
-  for (const f of fr) {
+  if (!summaries.length) { list.innerHTML = '<div class="empty">Turn on a channel\'s UART chip, or add an I²C or SPI bus.</div>'; return; }
+  const shown = items.filter(f => f.listed);
+  if (!shown.length) { list.innerHTML = '<div class="empty">Nothing decoded in this capture. Check the wiring, the ground and the channels each bus uses.</div>'; return; }
+  for (const f of shown) {
     const row = document.createElement('div');
     row.innerHTML = `<span class="t">${fmtTime((f.start - t0()) / rate)}</span><span class="c" style="color:${COLORS[f.ch]}"></span>
-      <span>${hex(f.byte)}</span><span>${esc(f.byte)}</span><span class="err">${f.ok ? '' : 'framing error'}</span>`;
+      <span>${hex(f.byte)}</span><span></span><span class="${f.bad ? 'err' : 'note'}"></span>`;
     row.querySelector('.c').textContent = label(f.ch);
+    row.children[3].textContent = f.chr;
+    row.children[4].textContent = f.note;
     row.onclick = () => {
       view.spp = Math.max((f.end - f.start) / 80, 1 / 60);
       view.start = (f.start + f.end) / 2 - W() / 2 * view.spp;
@@ -438,9 +489,9 @@ function renderDump() {
 }
 
 function dumpText() {
-  const lines = decoded.flatMap((d, ch) => d ? [`${label(ch)} @ ${d.baud ?? '?'} baud: ${d.frames.map(f => esc(f.byte)).join('')}`] : []);
-  lines.push('', 'time\tch\thex\tascii');
-  for (const f of allFrames()) lines.push(`${fmtTime((f.start - t0()) / rate)}\t${label(f.ch)}\t${hex(f.byte)}\t${esc(f.byte)}${f.ok ? '' : '\tframing error'}`);
+  const lines = summaries.map(sm => `${sm.ch >= 0 ? label(sm.ch) + ' ' : ''}${sm.what}: ${sm.text}`);
+  lines.push('', 'time\tch\thex\tascii\tnote');
+  for (const f of items.filter(f => f.listed)) lines.push(`${fmtTime((f.start - t0()) / rate)}\t${label(f.ch)}\t${hex(f.byte)}\t${f.chr}\t${f.note}`);
   return lines.join('\n');
 }
 $('copy').onclick = async () => {
@@ -448,6 +499,48 @@ $('copy').onclick = async () => {
   catch { $('copy').textContent = 'Copy failed'; }
   setTimeout(() => $('copy').textContent = 'Copy dump', 1500);
 };
+
+// ---- bus setup ----
+function busesChanged() { saveBuses(); renderBuses(); decode(); draw(); }
+function renderBuses() {
+  const box = $('buses');
+  box.innerHTML = '';
+  buses.forEach((b, k) => {
+    const row = document.createElement('div');
+    row.className = 'bus';
+    const pick = (key, text, optional) => {
+      const l = document.createElement('label'), sel = document.createElement('select');
+      if (optional) sel.add(new Option('—', -1));
+      for (let ch = 0; ch < 8; ch++) sel.add(new Option(label(ch), ch));
+      sel.value = b[key];
+      sel.onchange = () => { b[key] = +sel.value; busesChanged(); };
+      l.append(text + ' ', sel);
+      return l;
+    };
+    const choice = (key, options) => {
+      const sel = document.createElement('select');
+      for (const [v, t] of options) sel.add(new Option(t, v));
+      sel.value = b[key];
+      sel.onchange = () => { b[key] = typeof b[key] === 'boolean' ? sel.value === 'true' : +sel.value; busesChanged(); };
+      return sel;
+    };
+    const title = document.createElement('b');
+    title.textContent = b.type === 'i2c' ? 'I²C' : 'SPI';
+    row.append(title);
+    if (b.type === 'i2c') row.append(pick('scl', 'SCL'), pick('sda', 'SDA'));
+    else row.append(pick('sclk', 'SCLK'), pick('mosi', 'MOSI', true), pick('miso', 'MISO', true), pick('cs', 'CS', true),
+      choice('mode', [0, 1, 2, 3].map(m => [m, `mode ${m}`])), choice('msbFirst', [[true, 'MSB first'], [false, 'LSB first']]));
+    const rm = document.createElement('button');
+    rm.className = 'rm'; rm.textContent = '×'; rm.title = `Stop decoding this ${title.textContent} bus`;
+    rm.onclick = () => { buses.splice(k, 1); busesChanged(); };
+    row.append(rm);
+    box.append(row);
+  });
+}
+// defaults match examples/pro_micro_buses: I²C on D2/D3, SPI on D4–D7
+$('add-i2c').onclick = () => { buses.push({ type: 'i2c', scl: 2, sda: 3 }); busesChanged(); };
+$('add-spi').onclick = () => { buses.push({ type: 'spi', sclk: 4, mosi: 5, miso: 6, cs: 7, mode: 0, msbFirst: true }); busesChanged(); };
+renderBuses();
 
 // ---- view ----
 const W = () => cv.clientWidth, H = () => cv.clientHeight;
@@ -457,7 +550,7 @@ function fit() { if (data) { view.spp = data.length / W(); view.start = 0; } dra
  *  With UART bytes decoded, the first message is the burst, so a free-running clock on another line doesn't win. */
 function autoView() {
   if (!data) return draw();
-  const fr = allFrames().filter(f => trigIdx === null || f.end > trigIdx);
+  const fr = items.filter(f => trigIdx === null || f.end > trigIdx);
   if (fr.length) {
     let last = fr[0];
     for (const f of fr) if (f.start - last.end < (last.end - last.start) * 3) last = f; else break;
@@ -532,7 +625,7 @@ function draw() {
   const i0 = Math.max(0, Math.floor(iAt(0))), i1 = Math.min(data.length, Math.ceil(iAt(w)) + 1);
   for (let ch = 0; ch < 8; ch++) {
     const y = ruler + ch * rowH, m = 1 << ch;
-    const [hi, lo] = decoded[ch] ? [y + rowH * 0.12, y + rowH * 0.5] : [y + rowH * 0.24, y + rowH * 0.76];
+    const [hi, lo] = decodedRow(ch) ? [y + rowH * 0.12, y + rowH * 0.5] : [y + rowH * 0.24, y + rowH * 0.76];
     ctx.fillStyle = COLORS[ch] + '1c';
     ctx.beginPath();
     let prev = data[i0] & m, runStart = i0;
@@ -551,19 +644,28 @@ function draw() {
     if (prev) highRun(runStart, i1);
     ctx.strokeStyle = COLORS[ch]; ctx.lineWidth = 1.5; ctx.lineJoin = 'miter'; ctx.stroke();
 
-    // decoded UART bytes in the band under the trace
-    if (!decoded[ch]) continue;
+    // decoded bytes in the band under the trace
+    if (!decodedRow(ch)) continue;
     const by = y + rowH * 0.58, bh = rowH * 0.34;
     ctx.font = `${Math.min(12, bh - 4)}px ` + C('--mono'); ctx.textAlign = 'center';
-    for (const f of decoded[ch].frames) {
+    for (const f of items) {
+      if (f.ch !== ch) continue;
       const x0 = xOf(f.start), x1 = xOf(f.end);
       if (x1 < 0 || x0 > w) continue;
       const bw = Math.max(x1 - x0 - 1, 1);
-      ctx.fillStyle = f.ok ? COLORS[ch] + '33' : '#ff8a8f55';
+      ctx.fillStyle = f.bad ? '#ff8a8f55' : COLORS[ch] + '33';
       ctx.fillRect(x0, by, bw, bh);
-      ctx.fillStyle = f.ok ? COLORS[ch] : '#ff8a8f'; ctx.fillRect(x0, by, 1, bh);
-      const label = bw > 58 ? `${hex(f.byte)} ${esc(f.byte)}` : bw > 22 ? hex(f.byte) : '';
-      if (label) { ctx.fillStyle = C('--fg'); ctx.fillText(label, x0 + bw / 2, by + bh / 2 + 1); }
+      ctx.fillStyle = f.bad ? '#ff8a8f' : COLORS[ch]; ctx.fillRect(x0, by, 1, bh);
+      const text = bw > 58 ? f.long : bw > 22 ? f.short : '';
+      if (text) { ctx.fillStyle = C('--fg'); ctx.fillText(text, x0 + bw / 2, by + bh / 2 + 1); }
+    }
+    for (const mk of marks) {
+      if (mk.ch !== ch) continue;
+      const x = xOf(mk.at);
+      if (x < -8 || x > w + 8) continue;
+      ctx.fillStyle = mk.text === 'S' ? '#4cb764' : '#ef4f57';
+      ctx.fillRect(x - 6, by, 12, bh);
+      ctx.fillStyle = '#111317'; ctx.fillText(mk.text, x, by + bh / 2 + 1);
     }
     ctx.textAlign = 'left';
   }
@@ -649,21 +751,46 @@ new ResizeObserver(() => { clampView(); draw(); }).observe(cv);
 // ---- start ----
 if (tauri) refreshPorts().then(() => status('Ready.'));
 else {
-  // Demo signals so the viewer can be tried outside the app: a UART exchange on D0/D1 at
-  // 115200 baud, a clock and a counter, sampled at 1 MHz.
-  const n = 16384, rateD = 1e6, spb = rateD / 115200, d = new Uint8Array(n).fill(3);
+  // Demo signals so the viewer can be tried outside the app, sampled at 1 MHz: UART on D0/D1
+  // (AT commands at 115200), I²C on D2 SCL / D3 SDA (an SSD1306 display on, a TMP102 read) and
+  // SPI mode 0 on D4–D7 (reading a W25Q128 flash's JEDEC ID). Same wiring as examples/pro_micro_buses.
+  const n = 16384, rateD = 1e6, d = new Uint8Array(n).fill(0b10001111);   // idle: UART high, SCL/SDA high, CS high
+  const set = (i0, i1, ch, v) => { for (let i = Math.round(i0); i < Math.round(i1) && i < n; i++) d[i] = v ? d[i] | 1 << ch : d[i] & ~(1 << ch); };
+  const spb = rateD / 115200;
   const tx = (ch, at, text) => [...text].forEach((c, j) => {
-    const b = c.charCodeAt(0), s = at + j * spb * 11;
-    for (let k = 0; k < 10; k++) {
-      const bit = k === 0 ? 0 : k === 9 ? 1 : (b >> (k - 1)) & 1;
-      for (let i = Math.round(s + k * spb); i < Math.round(s + (k + 1) * spb); i++) d[i] = bit ? d[i] | 1 << ch : d[i] & ~(1 << ch);
-    }
+    const b = c.charCodeAt(0), s0 = at + j * spb * 11;
+    for (let k = 0; k < 10; k++) set(s0 + k * spb, s0 + (k + 1) * spb, ch, k === 0 ? 0 : k === 9 ? 1 : (b >> (k - 1)) & 1);
   });
   tx(0, 800, 'AT+GMR\r\n');
   tx(1, 2600, 'AT version:1.7.4\r\nOK\r\n');
   tx(0, 9000, 'AT+CWMODE=1\r\n');
   tx(1, 11400, 'OK\r\n');
-  for (let i = 0; i < n; i++) d[i] = (d[i] & 3) | ((i >> 5) & 1) << 2 | ((i >> 9) & 0x1f) << 3;
+  // I²C at ~83 kHz: 3 samples per quarter bit. ops: 'S' start, 'P' stop, [byte, ack]
+  const i2c = (at, ops) => {
+    let t = at, scl = 1, sda = 1;
+    const put = () => { set(t, t + 3, 2, scl); set(t, t + 3, 3, sda); t += 3; };
+    for (const op of ops) {
+      if (op === 'S') { sda = 1; put(); scl = 1; put(); sda = 0; put(); scl = 0; put(); }
+      else if (op === 'P') { sda = 0; put(); scl = 1; put(); sda = 1; put(); }
+      else for (const bit of [...Array(8)].map((_, k) => (op[0] >> (7 - k)) & 1).concat(op[1] ? 0 : 1)) {
+        sda = bit; put(); scl = 1; put(); put(); scl = 0; put();
+      }
+    }
+  };
+  i2c(4200, ['S', [0x3C << 1, 1], [0x00, 1], [0xAF, 1], 'P']);                              // display on
+  i2c(5600, ['S', [0x48 << 1, 1], [0x00, 1], 'S', [0x48 << 1 | 1, 1], [0x19, 1], [0x80, 0], 'P']); // read 25.5 °C
+  // SPI mode 0 at 250 kHz: CS low, then 8 clocks per byte, MOSI/MISO set before each rising edge
+  const spi = (at, mosi, miso) => {
+    let t = at;
+    set(t, t + 4, 7, 0); t += 4;
+    mosi.forEach((m, j) => { for (let k = 7; k >= 0; k--) {
+      set(t, t + 4, 5, (m >> k) & 1); set(t, t + 4, 6, (miso[j] >> k) & 1); set(t, t + 2, 4, 0); set(t + 2, t + 4, 4, 1); set(t, t + 4, 7, 0); t += 4;
+    } });
+    set(t, t + 2, 7, 0);
+  };
+  spi(13000, [0x9F, 0, 0, 0], [0xFF, 0xEF, 0x40, 0x18]);
+  if (!buses.length) buses.push({ type: 'i2c', scl: 2, sda: 3 }, { type: 'spi', sclk: 4, mosi: 5, miso: 6, cs: 7, mode: 0, msbFirst: true });
+  renderBuses();
   $('port').add(new Option('Demo data', ''));
   show(d, rateD, null);
   status('Demo data: open in the Mojo LA app to capture.');

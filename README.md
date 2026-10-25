@@ -133,8 +133,18 @@ jump to it, or **Copy dump** for a text log. Sample at 8× the baud rate or more
 <p align="center">
   <img src="docs/screenshots/uart-zoom.png" alt="Close-up of D0 with each UART frame boxed and labeled 41 A, 54 T, 2B +, and a marker measuring one 10-bit frame as 86 microseconds" width="900">
   <br><sub>Zoomed in: each frame is boxed with its byte, and a marker measures one 10-bit frame (86 µs at 115,200 baud).</sub>
-</p> `npx @tauri-apps/cli@2 build` in `viewer/src-tauri` makes a `.app` and
-`.dmg`. Opening `viewer/ui/index.html` in a browser shows the viewer with demo data.
+</p>
+
+**I²C and SPI.** In the **Decoded** tab, **+ I²C** and **+ SPI** add a bus; pick its lines by channel name.
+I²C shows start (`S`), repeated start (`Sr`) and stop (`P`), the 7-bit address with read/write, each byte, and
+ACK/NACK; a NACKed address is flagged. SPI reads MOSI and MISO together in mode 0–3, MSB or LSB first, framed by
+CS (optional). Bytes are boxed on the SDA / MOSI / MISO rows and listed with UART in time order. One capture records
+all 8 channels at once, so UART, I²C and SPI can be decoded side by side; set the rate for the fastest bus. Buses
+are remembered. Decoder tests: `node viewer/ui/buses.test.js`.
+
+`npx @tauri-apps/cli@2 build` in `viewer/src-tauri` makes a `.app` and `.dmg`. Opening `viewer/ui/index.html` in a
+browser shows the viewer with demo data: AT commands on UART, an SSD1306 and a TMP102 on I²C, and a flash ID read
+on SPI.
 
 ### Try it on a real UART: Arduino Pro Micro
 
@@ -175,6 +185,27 @@ On Apple silicon the Arduino AVR compiler is an Intel binary, so it needs Rosett
    ```bash
    .venv/bin/python -c "import serial; serial.Serial('/dev/cu.usbserial-XXXX', 115200).write(b'hello mojo\r\n')"
    ```
+
+### Three buses at once: `pro_micro_buses`
+
+[`examples/pro_micro_buses`](examples/pro_micro_buses/pro_micro_buses.ino) fills all 8 channels: the UART traffic
+above, plus I²C (bit-banged, playing both the master and the devices, so you see ACKs, a display switched on at
+`0x3C` and a TMP102 read as 25.5 °C at `0x48`) and SPI (a flash JEDEC-ID read, `9F 00 00 00`). It repeats every
+200 ms, so one 16 ms capture at 1 MHz triggered on D0 catches all three.
+
+| Mojo | Pro Micro | Bus |
+|---|---|---|
+| D0 (P51) | TXO | UART |
+| D1 (P50) | RXI | UART |
+| D2 (P41) | 3 (SCL) | I²C |
+| D3 (P40) | 2 (SDA) | I²C |
+| D4 (P35) | 15 (SCK) | SPI |
+| D5 (P34) | 16 (MOSI) | SPI |
+| D6 (P33) | 14 (MISO) | SPI |
+| D7 (P32) | 10 (CS) | SPI |
+
+Same voltage rule as above: on a 5 V Pro Micro every one of these needs a divider. In Mojo LA, the default **+ I²C**
+and **+ SPI** buses already match this wiring.
 
 **Capture with PulseView:** pick the driver *Openbench Logic Sniffer & SUMP compatibles*, serial port
 `/dev/cu.usbmodem*`, then *Scan for devices*. It shows up as **Mojo LA** with 8 channels.
@@ -255,6 +286,7 @@ logic_analyzer/   mojo_top.v (design + UARTs), mojo.ucf (pins), tb.v (testbench)
 led_counter/      mojo_top.v, mojo.ucf
 examples/
   pro_micro_uart/ Arduino Pro Micro sketch: UART traffic to test the analyzer with
+  pro_micro_buses/ UART + I²C + SPI at once, on all 8 channels
 viewer/
   ui/index.html   the whole frontend: canvas waveform view, no framework
   src-tauri/      Rust side: serial port listing and SUMP capture
