@@ -11,7 +11,7 @@
     --fg: #d8dbe0; --dim: #7d838d; --accent: #d4202c; --accent-hi: #ec3a45;
     --ui: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
     --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-    --ruler: 30px; --gutter: 140px;
+    --ruler: 30px; --gutter: 176px;
     color-scheme: dark;
   }
   * { box-sizing: border-box; }
@@ -45,7 +45,13 @@
   .gutter .spacer { height: var(--ruler); border-bottom: 1px solid var(--line); font-size: 10px; color: var(--dim); text-transform: uppercase; letter-spacing: .08em; display: flex; align-items: end; justify-content: flex-end; padding: 0 10px 5px; }
   .ch { flex: 1; display: flex; align-items: center; gap: 8px; padding: 0 10px; border-bottom: 1px solid var(--grid); }
   .ch .swatch { width: 4px; align-self: stretch; margin: 10px 0; border-radius: 2px; }
-  .ch .name { font: 600 12px var(--mono); flex: 1; }
+  .ch .name { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 1px;
+    background: none; border: 0; padding: 2px 4px; margin-left: -4px; border-radius: 4px; text-align: left; cursor: text; }
+  .ch .name:hover { background: var(--grid); }
+  .ch .name b { font: 600 12px var(--mono); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ch .name small { font: 10px var(--mono); color: var(--dim); white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+  .ch input.rename { flex: 1; min-width: 0; font: 600 12px var(--mono); color: var(--fg); background: var(--bg);
+    border: 1px solid var(--accent-hi); border-radius: 4px; padding: 3px 4px; }
   .trig { font: 600 11px var(--mono); width: 26px; padding: 3px 0; text-align: center; border-radius: 4px; color: var(--dim); }
   .trig[data-v="0"], .trig[data-v="1"] { color: #fff; border-color: var(--accent); background: color-mix(in srgb, var(--accent) 35%, transparent); }
   .uart { font: 600 10px var(--mono); padding: 3px 5px; border-radius: 4px; color: var(--dim); }
@@ -60,9 +66,10 @@
   #warn { color: #f2cc4c; font-size: 12px; }
   #copy { font-size: 12px; padding: 3px 10px; }
   #frames { overflow: auto; font: 12px/1.7 var(--mono); padding: 4px 0; font-variant-numeric: tabular-nums; }
-  #frames div { display: grid; grid-template-columns: 110px 34px 34px 60px 1fr; gap: 8px; padding: 0 14px; cursor: pointer; }
+  #frames div { display: grid; grid-template-columns: 110px minmax(34px, 12ch) 34px 60px 1fr; gap: 8px; padding: 0 14px; cursor: pointer; }
   #frames div:hover { background: var(--grid); }
   #frames .t { color: var(--dim); text-align: right; }
+  #frames .c { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #frames .err { color: #ff8a8f; }
   #frames .empty { cursor: default; color: var(--dim); font-family: var(--ui); display: block; }
   canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; cursor: crosshair; }
@@ -139,6 +146,12 @@ let view = { start: 0, spp: 1 };          // first visible sample, samples per C
 let hoverX = null, marker = null;
 const trig = Array(8).fill('X');          // per channel: X (don't care), 0, 1
 const trigBtns = [];
+// Header pin behind each channel (see logic_analyzer/mojo.ucf), shown under its name.
+const PINS = [51, 50, 41, 40, 35, 34, 33, 32];
+const NAMES_KEY = 'mojo-la.channel-names';
+const names = (() => { try { const n = JSON.parse(localStorage.getItem(NAMES_KEY)); if (Array.isArray(n)) return n.slice(0, 8); } catch {} return []; })();
+const label = ch => names[ch] || `D${ch}`;
+function saveNames() { try { localStorage.setItem(NAMES_KEY, JSON.stringify(names)); } catch {} }
 let running = false;                      // live mode
 const uartOn = [true, true, false, false, false, false, false, false];
 let decoded = [];                         // per channel: {baud, frames} or null
@@ -160,9 +173,33 @@ $('baud').onchange = () => { decode(); draw(); };
 for (let ch = 0; ch < 8; ch++) {
   const row = document.createElement('div');
   row.className = 'ch';
-  row.innerHTML = `<span class="swatch" style="background:${COLORS[ch]}"></span><span class="name">D${ch}</span>
+  row.innerHTML = `<span class="swatch" style="background:${COLORS[ch]}"></span>
+    <button class="name" title="Rename D${ch} (header pin ${PINS[ch]})"><b></b><small></small></button>
     <button class="uart" aria-pressed="${uartOn[ch]}" title="Decode D${ch} as UART">UART</button>
     <button class="trig" data-v="X" title="Trigger on D${ch}: don't care, low or high">X</button>`;
+  const nm = row.querySelector('.name');
+  const showName = () => {
+    nm.querySelector('b').textContent = label(ch);
+    nm.querySelector('small').textContent = names[ch] ? `D${ch} · P${PINS[ch]}` : `P${PINS[ch]}`;
+  };
+  showName();
+  nm.onclick = () => {
+    const input = document.createElement('input');
+    input.className = 'rename'; input.maxLength = 12; input.value = names[ch] || ''; input.placeholder = `D${ch}`;
+    input.setAttribute('aria-label', `Name for D${ch}`);
+    nm.replaceWith(input); input.focus(); input.select();
+    let done = false;
+    const finish = keep => {
+      if (done) return; done = true;
+      if (keep) { names[ch] = input.value.trim(); saveNames(); }
+      input.replaceWith(nm); showName(); renderDump(); nm.focus();
+    };
+    // preventDefault: otherwise this Enter also clicks the name button that gets focus back, reopening the editor
+    input.onkeydown = e => {
+      if (e.key === 'Enter' || e.key === 'Escape') { e.preventDefault(); finish(e.key === 'Enter'); }
+    };
+    input.onblur = () => finish(true);
+  };
   const b = row.querySelector('.trig'), u = row.querySelector('.uart');
   trigBtns[ch] = b;
   b.onclick = () => setTrig(ch, { X: '0', 0: '1', 1: 'X' }[trig[ch]]);
@@ -261,7 +298,7 @@ async function auto() {
   trig.forEach((_, ch) => setTrig(ch, 'X'));
   setTrig(s.channel, s.idleHigh ? '0' : '1');
   $('pre').value = 10;
-  await capture(`Auto: D${s.channel} rests ${s.idleHigh ? 'high' : 'low'}, shortest pulse ${fmtTime(s.pulseNs / 1e9)} → `);
+  await capture(`Auto: ${label(s.channel)} rests ${s.idleHigh ? 'high' : 'low'}, shortest pulse ${fmtTime(s.pulseNs / 1e9)} → `);
 }
 
 function show(d, r, t, keepView = false) {
@@ -297,10 +334,11 @@ function renderDump() {
   decoded.forEach((d, ch) => {
     if (!d) return;
     const s = document.createElement('span');
-    s.innerHTML = `<b style="color:${COLORS[ch]}">D${ch}</b> ${d.baud ? d.baud.toLocaleString() + ' baud' : 'idle'}: `;
+    s.innerHTML = `<b style="color:${COLORS[ch]}"></b> ${d.baud ? d.baud.toLocaleString() + ' baud' : 'idle'}: `;
+    s.querySelector('b').textContent = label(ch); // names are user text: never innerHTML
     s.append(d.frames.map(f => esc(f.byte)).join('') || '–');
     $('streams').append(s);
-    if (d.baud && rate / d.baud < 4) slow.push(`D${ch}`);
+    if (d.baud && rate / d.baud < 4) slow.push(label(ch));
   });
   $('warn').textContent = slow.length ? `Sample rate too low for ${slow.join(', ')}: use at least 8× the baud rate.` : '';
   const fr = allFrames(), list = $('frames');
@@ -308,8 +346,9 @@ function renderDump() {
   if (!fr.length) { list.innerHTML = '<div class="empty">No UART bytes in this capture. Check the wiring and ground, or raise the sample count.</div>'; return; }
   for (const f of fr) {
     const row = document.createElement('div');
-    row.innerHTML = `<span class="t">${fmtTime((f.start - t0()) / rate)}</span><span style="color:${COLORS[f.ch]}">D${f.ch}</span>
+    row.innerHTML = `<span class="t">${fmtTime((f.start - t0()) / rate)}</span><span class="c" style="color:${COLORS[f.ch]}"></span>
       <span>${hex(f.byte)}</span><span>${esc(f.byte)}</span><span class="err">${f.ok ? '' : 'framing error'}</span>`;
+    row.querySelector('.c').textContent = label(f.ch);
     row.onclick = () => {
       view.spp = Math.max((f.end - f.start) / 80, 1 / 60);
       view.start = (f.start + f.end) / 2 - W() / 2 * view.spp;
@@ -320,9 +359,9 @@ function renderDump() {
 }
 
 function dumpText() {
-  const lines = decoded.flatMap((d, ch) => d ? [`D${ch} @ ${d.baud ?? '?'} baud: ${d.frames.map(f => esc(f.byte)).join('')}`] : []);
+  const lines = decoded.flatMap((d, ch) => d ? [`${label(ch)} @ ${d.baud ?? '?'} baud: ${d.frames.map(f => esc(f.byte)).join('')}`] : []);
   lines.push('', 'time\tch\thex\tascii');
-  for (const f of allFrames()) lines.push(`${fmtTime((f.start - t0()) / rate)}\tD${f.ch}\t${hex(f.byte)}\t${esc(f.byte)}${f.ok ? '' : '\tframing error'}`);
+  for (const f of allFrames()) lines.push(`${fmtTime((f.start - t0()) / rate)}\t${label(f.ch)}\t${hex(f.byte)}\t${esc(f.byte)}${f.ok ? '' : '\tframing error'}`);
   return lines.join('\n');
 }
 $('copy').onclick = async () => {
@@ -504,7 +543,7 @@ cv.addEventListener('pointerup', e => {
 });
 cv.addEventListener('pointerleave', () => { hoverX = null; draw(); });
 addEventListener('keydown', e => {
-  if (e.target.tagName === 'SELECT' || e.target.tagName === 'BUTTON' && (e.key === 'Enter' || e.key === ' ')) return;
+  if (e.target.tagName === 'SELECT' || e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' && (e.key === 'Enter' || e.key === ' ')) return;
   if (e.key === 'f' || e.key === 'F') fit();
   else if (e.key === 'Enter' && !$('capture').disabled) capture();
   else if (e.key === ' ' && !$('run').disabled) { e.preventDefault(); run(); }
