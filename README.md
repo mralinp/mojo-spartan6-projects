@@ -148,6 +148,11 @@ I²C/SPI buses. **Open** (⌘O) brings it back. **Export** writes **VCD** (opens
 named after your channels, 1 ns timescale) or **CSV** (time from the trigger in seconds, then one 0/1 column per
 channel). Tests: `node viewer/ui/files.test.js`.
 
+**Nothing seen is lost.** The **History** tab lists every capture, newest first: single captures, each live
+frame, opened files and the demo. Each one shows a small preview of all 8 channels, when it was taken, its size and
+its rate. Click one to view it again (live mode stops so it stays put). **☆ Pin** keeps a capture, even after
+restarting the app; unpinned ones roll off after the newest 30. **Save** writes any of them as a `.mojola`.
+
 `npx @tauri-apps/cli@2 build` in `viewer/src-tauri` makes a `.app` and `.dmg`. Opening `viewer/ui/index.html` in a
 browser shows the viewer with demo data: AT commands on UART, an SSD1306 and a TMP102 on I²C, and a flash ID read
 on SPI.
