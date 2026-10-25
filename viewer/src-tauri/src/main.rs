@@ -277,10 +277,45 @@ async fn autoset(link: tauri::State<'_, Link>, port: String) -> Result<Setup, St
         .map_err(|e| e.to_string())?
 }
 
+/// Files the UI may write or read: only our own formats, never an arbitrary path's contents.
+fn checked_path(path: &str, allowed: &[&str]) -> Result<std::path::PathBuf, String> {
+    let p = std::path::PathBuf::from(path);
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if allowed.contains(&ext.as_str()) {
+        Ok(p)
+    } else {
+        Err(format!(
+            "Mojo LA only handles .{} files.",
+            allowed.join(", .")
+        ))
+    }
+}
+
+/// Saves a capture or an export to a path the user picked in the save dialog.
+#[tauri::command]
+fn write_text(path: String, contents: String) -> Result<(), String> {
+    let p = checked_path(&path, &["mojola", "vcd", "csv"])?;
+    std::fs::write(&p, contents).map_err(|e| format!("Couldn't save {}: {e}", p.display()))
+}
+
+/// Reads a capture the user picked in the open dialog.
+#[tauri::command]
+fn read_text(path: String) -> Result<String, String> {
+    let p = checked_path(&path, &["mojola"])?;
+    std::fs::read_to_string(&p).map_err(|e| format!("Couldn't open {}: {e}", p.display()))
+}
+
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(Link::default())
-        .invoke_handler(tauri::generate_handler![list_ports, capture, autoset])
+        .invoke_handler(tauri::generate_handler![
+            list_ports, capture, autoset, write_text, read_text
+        ])
         .run(tauri::generate_context!())
         .expect("error while running Mojo LA");
 }
@@ -318,6 +353,18 @@ mod tests {
             &setup(&settings(50_000_000, 1024, 0, 0, 0))[10..15],
             &[0x81, 0xFF, 0x00, 0x00, 0x00]
         );
+    }
+
+    #[test]
+    fn file_paths() {
+        assert!(checked_path("/tmp/a.mojola", &["mojola"]).is_ok());
+        assert!(checked_path("/tmp/A.VCD", &["vcd"]).is_ok());
+        assert!(checked_path("/etc/passwd", &["mojola", "vcd", "csv"]).is_err());
+        assert!(checked_path("/tmp/a.csv", &["mojola"]).is_err());
+        let dir = std::env::temp_dir().join("mojo-la-test.mojola");
+        write_text(dir.to_string_lossy().into(), "{}".into()).unwrap();
+        assert_eq!(read_text(dir.to_string_lossy().into()).unwrap(), "{}");
+        let _ = std::fs::remove_file(dir);
     }
 
     #[test]
