@@ -76,6 +76,19 @@
   .bus select { font-size: 12px; padding: 2px 4px; }
   .bus .rm { margin-left: auto; padding: 1px 8px; }
   #measure { overflow: auto; min-height: 0; }
+  #history { overflow: auto; min-height: 0; }
+  #hlist { list-style: none; margin: 0; padding: 4px 0; }
+  #hlist li { display: grid; grid-template-columns: 168px 1fr auto auto; align-items: center; gap: 14px; padding: 4px 14px;
+    border-bottom: 1px solid var(--grid); cursor: pointer; font-size: 12px; }
+  #hlist li:hover { background: var(--grid); }
+  #hlist li[aria-current="true"] { box-shadow: inset 3px 0 0 var(--accent-hi); background: var(--grid); }
+  #hlist canvas { width: 168px; height: 34px; display: block; background: var(--bg); border-radius: 3px; }
+  #hlist .when { font: 12px var(--mono); font-variant-numeric: tabular-nums; }
+  #hlist .meta { color: var(--dim); }
+  #hlist button { font-size: 12px; padding: 2px 8px; }
+  #hlist button[aria-pressed="true"] { color: #f2cc4c; border-color: #f2cc4c; }
+  #hlist .empty { display: block; color: var(--dim); cursor: default; padding: 10px 14px; }
+  #hcount { color: var(--dim); font-weight: 400; }
   #measure table { border-collapse: collapse; width: 100%; font: 12px/1.6 var(--mono); font-variant-numeric: tabular-nums; }
   #measure th { position: sticky; top: 0; background: var(--panel); font: 600 10px var(--ui); text-transform: uppercase;
     letter-spacing: .06em; color: var(--dim); text-align: right; padding: 6px 14px 4px; border-bottom: 1px solid var(--line); }
@@ -98,8 +111,8 @@
   #frames .c { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #frames .err { color: #ff8a8f; }
   #frames .empty { cursor: default; color: var(--dim); font-family: var(--ui); display: block; }
-  canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; cursor: crosshair; }
-  canvas.dragging { cursor: grabbing; }
+  #cv { position: absolute; inset: 0; width: 100%; height: 100%; display: block; cursor: crosshair; }
+  #cv.dragging { cursor: grabbing; }
 
   footer { display: flex; gap: 22px; flex-wrap: wrap; padding: 7px 14px; background: var(--panel); border-top: 1px solid var(--line); font: 12px var(--mono); color: var(--dim); font-variant-numeric: tabular-nums; }
   footer b { color: var(--fg); font-weight: 500; }
@@ -146,6 +159,7 @@
   <div class="tabs" role="tablist">
     <button role="tab" id="tab-measure" aria-selected="true" aria-controls="measure">Measurements</button>
     <button role="tab" id="tab-dump" aria-selected="false" aria-controls="dump">Decoded</button>
+    <button role="tab" id="tab-history" aria-selected="false" aria-controls="history">History <span id="hcount"></span></button>
     <label class="scope" id="scope-wrap">Over <select id="scope"><option value="all">whole capture</option><option value="view">visible window</option></select></label>
   </div>
   <div id="measure" role="tabpanel" aria-labelledby="tab-measure">
@@ -154,6 +168,7 @@
       <tbody id="mrows"></tbody>
     </table>
   </div>
+  <div id="history" role="tabpanel" aria-labelledby="tab-history" hidden><ol id="hlist"></ol></div>
   <div id="dump" role="tabpanel" aria-labelledby="tab-dump" hidden>
     <div class="bar">
       <div id="streams"></div>
@@ -305,7 +320,7 @@ async function capture(note = '') {
   try {
     const bytes = await tauri.core.invoke('capture', { port: req.port, s: req.s });
     if (!bytes) status(`Trigger didn't fire within ${TRIGGER_WAIT_MS / 1000} s.`, true);
-    else { show(Uint8Array.from(bytes), req.s.rate, req.trigIdx); status(note + summary(req)); }
+    else { show(Uint8Array.from(bytes), req.s.rate, req.trigIdx); remember('capture'); status(note + summary(req)); }
   } catch (e) {
     status(String(e), true);
   } finally {
@@ -331,6 +346,7 @@ async function run() {
       // keep the user's zoom and marker once there's a frame of the same shape to compare against
       const keep = !fresh && data?.length === bytes.length && rate === req.s.rate;
       show(Uint8Array.from(bytes), req.s.rate, req.trigIdx, keep);
+      remember(`live #${++liveFrame}`);
       fresh = false; frames++;
       status(`Live · ${frames} captures · ${(frames * 1000 / (performance.now() - t0)).toFixed(1)}/s · ${summary(req)}`);
     } catch (e) {
@@ -451,10 +467,98 @@ function loadCapture(c, name) {
   buses.splice(0, buses.length, ...c.buses);
   saveBuses(); renderBuses();
   show(c.samples, c.rate, c.trigIdx);
-  takenAt = c.takenAt;
+  takenAt = c.takenAt || takenAt;
+  remember(basename(name));
   status(`Opened ${basename(name)} · ${c.samples.length.toLocaleString()} samples at ${fmtHz(c.rate)}` +
     (c.takenAt ? ` · taken ${new Date(c.takenAt).toLocaleString()}` : ''));
 }
+// ---- history: every capture, newest first ----
+const HISTORY_LIMIT = 30;                 // unpinned captures kept; pinned ones stay, and survive restarts
+const PINNED_KEY = 'mojo-la.pinned';
+let hist = [], historyId = 0, currentId = null, liveFrame = 0;
+
+function remember(source) {
+  const e = { id: ++historyId, samples: data, rate, trigIdx, takenAt, source, pinned: false };
+  hist.unshift(e);
+  currentId = e.id;
+  let unpinned = 0;
+  hist = hist.filter(h => h.pinned || ++unpinned <= HISTORY_LIMIT);
+  renderHistory();
+}
+function savePinned() {
+  try {
+    localStorage.setItem(PINNED_KEY, JSON.stringify(hist.filter(h => h.pinned).map(h =>
+      ({ samples: toB64(h.samples), rate: h.rate, trigIdx: h.trigIdx, takenAt: h.takenAt, source: h.source }))));
+    return true;
+  } catch { return false; }
+}
+function loadPinned() {
+  try {
+    for (const p of JSON.parse(localStorage.getItem(PINNED_KEY)) || [])
+      hist.push({ id: ++historyId, samples: fromB64(p.samples), rate: p.rate, trigIdx: p.trigIdx, takenAt: p.takenAt, source: p.source, pinned: true });
+  } catch {}
+}
+function viewEntry(e) {
+  running = false;                        // a live frame would replace it straight away
+  show(e.samples, e.rate, e.trigIdx);
+  takenAt = e.takenAt; currentId = e.id;
+  renderHistory();
+  status(`Viewing ${e.source} from ${new Date(e.takenAt).toLocaleTimeString()} · ${e.samples.length.toLocaleString()} samples at ${fmtHz(e.rate)}`);
+}
+/** 8 channels in 168×34: a line per channel, a solid block where it toggles within a pixel. */
+function thumb(e) {
+  const c = document.createElement('canvas'), dpr = devicePixelRatio || 1, W = 168, H = 34;
+  c.width = W * dpr; c.height = H * dpr;
+  const g = c.getContext('2d'); g.scale(dpr, dpr);
+  const n = e.samples.length, rowH = H / 8;
+  for (let ch = 0; ch < 8; ch++) {
+    g.fillStyle = COLORS[ch];
+    const y = ch * rowH, m = 1 << ch;
+    for (let x = 0; x < W; x++) {
+      let hi = 0, lo = 0;
+      for (let i = Math.floor(x * n / W), end = Math.floor((x + 1) * n / W); i < end; i++) (e.samples[i] & m) ? hi++ : lo++;
+      if (hi && lo) g.fillRect(x, y + 0.5, 1, rowH - 1);
+      else g.fillRect(x, hi ? y + 0.5 : y + rowH - 1.5, 1, 1);
+    }
+  }
+  return c;
+}
+function renderHistory() {
+  $('hcount').textContent = hist.length ? `(${hist.length})` : '';
+  const list = $('hlist');
+  list.innerHTML = '';
+  if (!hist.length) { list.innerHTML = '<li class="empty">Captures show up here as you take them.</li>'; return; }
+  for (const e of hist) {
+    const li = document.createElement('li');
+    li.setAttribute('aria-current', e.id === currentId);
+    li.title = 'View this capture';
+    li.innerHTML = `<span></span><span><span class="when"></span> <span class="meta"></span></span>
+      <button class="pin" aria-pressed="${e.pinned}" title="Pin: keep it, even after restarting">${e.pinned ? '★ Pinned' : '☆ Pin'}</button>
+      <button class="save" title="Save as a .mojola file">Save</button>`;
+    li.children[0].append(thumb(e));
+    li.querySelector('.when').textContent = new Date(e.takenAt).toLocaleTimeString();
+    li.querySelector('.meta').textContent = `${e.source} · ${(e.samples.length / 1024).toFixed(0)}K at ${fmtHz(e.rate)}` +
+      (e.trigIdx !== null ? ' · triggered' : '');
+    li.onclick = () => viewEntry(e);
+    li.querySelector('.pin').onclick = ev => {
+      ev.stopPropagation();
+      e.pinned = !e.pinned;
+      if (!savePinned()) { e.pinned = false; savePinned(); status('Couldn\'t keep the pin: browser storage is full. Save it as a file instead.', true); }
+      renderHistory();
+    };
+    li.querySelector('.save').onclick = async ev => {
+      ev.stopPropagation();
+      try {
+        const at = await saveText(`mojo-la-${stamp()}.mojola`, serializeCapture({ ...current(), samples: e.samples, rate: e.rate, trigIdx: e.trigIdx, takenAt: e.takenAt }), 'mojola', 'Mojo LA capture');
+        if (at) status(`Saved ${basename(at)}`);
+      } catch (err) { status(String(err), true); }
+    };
+    list.append(li);
+  }
+}
+loadPinned();
+renderHistory();
+
 $('open').onclick = openCapture;
 $('save').onclick = saveCapture;
 $('export').onchange = e => { const k = e.target.value; e.target.value = ''; if (k) exportAs(k); };
@@ -487,7 +591,7 @@ function renderMeasure(force = false) {
   }
 }
 function selectTab(which) {
-  for (const [tab, panel] of [['tab-measure', 'measure'], ['tab-dump', 'dump']]) {
+  for (const [tab, panel] of [['tab-measure', 'measure'], ['tab-dump', 'dump'], ['tab-history', 'history']]) {
     const on = panel === which;
     $(tab).setAttribute('aria-selected', on); $(panel).hidden = !on;
   }
@@ -495,6 +599,7 @@ function selectTab(which) {
 }
 $('tab-measure').onclick = () => selectTab('measure');
 $('tab-dump').onclick = () => selectTab('dump');
+$('tab-history').onclick = () => selectTab('history');
 $('scope').onchange = () => renderMeasure(true);
 
 // ---- decoding ----
@@ -886,6 +991,7 @@ else {
   renderBuses();
   $('port').add(new Option('Demo data', ''));
   show(d, rateD, null);
+  remember('demo');
   status('Demo data: open in the Mojo LA app to capture.');
 }
 </script>
