@@ -43,13 +43,18 @@
   #status.err { color: #ff8a8f; }
 
   main { display: grid; grid-template-columns: var(--gutter) 1fr; min-height: 0; }
-  .gutter { display: flex; flex-direction: column; border-right: 1px solid var(--line); background: var(--panel); }
+  .gutter { min-height: 0; overflow: hidden; display: flex; flex-direction: column; border-right: 1px solid var(--line); background: var(--panel); }
   .gutter .spacer { height: var(--ruler); border-bottom: 1px solid var(--line); font-size: 10px; color: var(--dim); text-transform: uppercase; letter-spacing: .08em; display: flex; align-items: end; justify-content: flex-end; padding: 0 10px 5px; }
-  .ch { flex: 1; display: flex; align-items: center; gap: 8px; padding: 0 10px; border-bottom: 1px solid var(--grid); }
+  .ch { flex: 1 1 0; min-height: 0; overflow: hidden; display: flex; align-items: center; gap: 8px; padding: 0 10px; border-bottom: 1px solid var(--grid); }
   .ch .swatch { width: 4px; align-self: stretch; margin: 10px 0; border-radius: 2px; }
   .ch .name { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 1px;
     background: none; border: 0; padding: 2px 4px; margin-left: -4px; border-radius: 4px; text-align: left; cursor: text; }
   .ch .name:hover { background: var(--grid); }
+  /* 16 rows: one line per row, so the gutter stays in step with the traces */
+  .gutter.dense .ch .name small { display: none; }
+  .gutter.dense .ch .name { padding: 0 4px; }
+  .gutter.dense .trig, .gutter.dense .uart { padding: 0 4px; font-size: 9px; }
+  .gutter.dense .ch .swatch { margin: 3px 0; }
   .ch .name b { font: 600 12px var(--mono); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .ch .name small { font: 10px var(--mono); color: var(--dim); white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
   .ch input.rename { flex: 1; min-width: 0; font: 600 12px var(--mono); color: var(--fg); background: var(--bg);
@@ -143,6 +148,7 @@
     <span class="port"><select id="port"></select><button class="icon" id="refresh" title="Rescan serial ports" aria-label="Rescan serial ports">↻</button></span>
   </label>
   <label class="field">Sample rate <select id="rate"></select></label>
+  <label class="field">Channels <select id="chans" title="16 sends two bytes per sample, so captures take twice as long to transfer"><option value="8">8</option><option value="16">16</option></select></label>
   <label class="field">Samples <select id="samples"></select></label>
   <label class="field">Before trigger <select id="pre"></select></label>
   <label class="field">UART baud <select id="baud"></select></label>
@@ -223,7 +229,8 @@
 <script src="compare.js"></script>
 <script>
 // Probe-lead colours, as on Saleae/sigrok harnesses: black, brown, red, orange, yellow, green, blue, violet.
-const COLORS = ['#a3a9b2', '#c08a5c', '#ef4f57', '#f2913f', '#f2cc4c', '#4cb764', '#4c96f7', '#a77ce6'];
+const COLORS = ['#a3a9b2', '#c08a5c', '#ef4f57', '#f2913f', '#f2cc4c', '#4cb764', '#4c96f7', '#a77ce6',
+  '#d4d8de', '#dcb08c', '#ff9297', '#ffb877', '#fde38a', '#86d79a', '#8dbcfa', '#c8acf2']; // D8-D15: the same leads, lighter
 // Every rate divides the analyzer's 200 MHz clock evenly. Keep in sync with RATES in src-tauri/src/main.rs.
 const RATES = [200e6, 100e6, 50e6, 25e6, 10e6, 5e6, 2e6, 1e6, 500e3, 200e3, 100e3, 50e3, 10e3, 1e3];
 const SIZES = [1024, 2048, 4096, 8192, 16384];
@@ -240,16 +247,20 @@ let ref = null, cmp = null;               // compare: the reference history entr
 let view = { start: 0, spp: 1 };          // first visible sample, samples per CSS pixel
 let hoverX = null, marker = null, markerB = null; // A: click, B: shift-click
 let edgesAll = [], edgesBy = [];          // edges on any channel / per channel, for marker snapping
-const trig = Array(8).fill('X');          // per channel: X (don't care), 0, 1
+const trig = Array(16).fill('X');          // per channel: X (don't care), 0, 1
 const trigBtns = [], uartBtns = [], nameRefresh = [];
 // Header pin behind each channel (see logic_analyzer/mojo.ucf), shown under its name.
-const PINS = [51, 50, 41, 40, 35, 34, 33, 32];
+const PINS = [51, 50, 41, 40, 35, 34, 33, 32, 30, 29, 27, 26, 24, 23, 22, 21];
 const NAMES_KEY = 'mojo-la.channel-names';
-const names = (() => { try { const n = JSON.parse(localStorage.getItem(NAMES_KEY)); if (Array.isArray(n)) return n.slice(0, 8); } catch {} return []; })();
+const names = (() => { try { const n = JSON.parse(localStorage.getItem(NAMES_KEY)); if (Array.isArray(n)) return n.slice(0, 16); } catch {} return []; })();
 const label = ch => names[ch] || `D${ch}`;
 function saveNames() { try { localStorage.setItem(NAMES_KEY, JSON.stringify(names)); } catch {} }
 let running = false;                      // live mode
-const uartOn = [true, true, false, false, false, false, false, false];
+const uartOn = [true, true, ...Array(14).fill(false)];
+// Channels in a capture: 16-channel ones arrive as 16-bit samples, 8-channel ones as bytes.
+const chOf = d => d instanceof Uint16Array ? 16 : 8;
+let nch = 8;                              // channels of the capture on screen
+const chRows = [];
 // Decoded bytes from every decoder (UART per channel, I²C and SPI per bus), in time order:
 // {start, end, ch (row it's drawn on), byte, long, short, note, bad, listed}
 let items = [], marks = [], summaries = [], slowLines = [];   // marks: I²C start/stop tags
@@ -272,10 +283,12 @@ fill($('pre'), PRE, p => p + '%', 25);
 fill($('baud'), [0, ...UART_BAUDS], b => b ? b.toLocaleString() : 'Auto', 0);
 $('baud').onchange = () => { decode(); draw(); };
 
-// Channel gutter with trigger chips
-for (let ch = 0; ch < 8; ch++) {
+// Channel gutter with trigger chips: all 16 rows, the ones past the capture's channels hidden
+for (let ch = 0; ch < 16; ch++) {
   const row = document.createElement('div');
   row.className = 'ch';
+  row.hidden = ch >= nch;
+  chRows[ch] = row;
   row.innerHTML = `<span class="swatch" style="background:${COLORS[ch]}"></span>
     <button class="name" title="Rename D${ch} (header pin ${PINS[ch]})"><b></b><small></small></button>
     <button class="uart" aria-pressed="${uartOn[ch]}" title="Decode D${ch} as UART">UART</button>
@@ -332,10 +345,10 @@ function request(waitMs) {
   if (!port) { status('Plug in the Mojo, then press ↻ to find its port.', true); return null; }
   const samples = +$('samples').value, r = +$('rate').value;
   let mask = 0, value = 0;
-  trig.forEach((t, ch) => { if (t !== 'X') { mask |= 1 << ch; if (t === '1') value |= 1 << ch; } });
+  trig.forEach((t, ch) => { if (t !== 'X' && ch < +$('chans').value) { mask |= 1 << ch; if (t === '1') value |= 1 << ch; } });
   // With no trigger, keep every sample after arming so none are stale.
   const post = mask ? Math.max(4, Math.round(samples * (100 - +$('pre').value) / 400) * 4) : samples;
-  return { port, s: { rate: r, samples, post, mask, value, waitMs }, trigIdx: mask ? samples - 1 - post : null };
+  return { port, s: { rate: r, samples, post, mask, value, waitMs, channels: +$('chans').value }, trigIdx: mask ? samples - 1 - post : null };
 }
 const summary = req => `${req.s.samples.toLocaleString()} samples at ${fmtHz(req.s.rate)} · ${fmtTime(req.s.samples / req.s.rate)}`;
 
@@ -347,7 +360,7 @@ async function capture(note = '') {
   try {
     const bytes = await tauri.core.invoke('capture', { port: req.port, s: req.s });
     if (!bytes) status(`Trigger didn't fire within ${TRIGGER_WAIT_MS / 1000} s.`, true);
-    else { show(Uint8Array.from(bytes), req.s.rate, req.trigIdx); remember('capture'); status(note + summary(req)); }
+    else { show(samplesOf(bytes, req), req.s.rate, req.trigIdx); remember('capture'); status(note + summary(req)); }
   } catch (e) {
     status(String(e), true);
   } finally {
@@ -372,7 +385,7 @@ async function run() {
       if (!bytes) { status('Live · waiting for trigger…'); continue; }
       // keep the user's zoom and marker once there's a frame of the same shape to compare against
       const keep = !fresh && data?.length === bytes.length && rate === req.s.rate;
-      show(Uint8Array.from(bytes), req.s.rate, req.trigIdx, keep);
+      show(samplesOf(bytes, req), req.s.rate, req.trigIdx, keep);
       remember(`live #${++liveFrame}`);
       fresh = false; frames++;
       status(`Live · ${frames} captures · ${(frames * 1000 / (performance.now() - t0)).toFixed(1)}/s · ${summary(req)}`);
@@ -394,7 +407,7 @@ async function auto() {
   status('Auto: looking for activity…');
   let s;
   try {
-    s = await tauri.core.invoke('autoset', { port });
+    s = await tauri.core.invoke('autoset', { port, channels: +$('chans').value });
   } catch (e) {
     busy(false);
     return status(String(e), true);
@@ -407,15 +420,19 @@ async function auto() {
   await capture(`Auto: ${label(s.channel)} rests ${s.idleHigh ? 'high' : 'low'}, shortest pulse ${fmtTime(s.pulseNs / 1e9)} → `);
 }
 
+const samplesOf = (bytes, req) => req.s.channels > 8 ? Uint16Array.from(bytes) : Uint8Array.from(bytes);
 function show(d, r, t, keepView = false) {
   data = d; rate = r; trigIdx = t; takenAt = new Date().toISOString();
+  nch = chOf(d);
+  chRows.forEach((row, ch) => { row.hidden = ch >= nch; });
+  $('gutter').classList.toggle('dense', nch > 8);
   if (!keepView) marker = markerB = null;
-  edgesAll = []; edgesBy = [[], [], [], [], [], [], [], []];
+  edgesAll = []; edgesBy = Array.from({ length: 16 }, () => []);
   for (let i = 1; i < d.length; i++) {
     const x = d[i] ^ d[i - 1];
     if (!x) continue;
     edgesAll.push(i);
-    for (let ch = 0; ch < 8; ch++) if (x >> ch & 1) edgesBy[ch].push(i);
+    for (let ch = 0; ch < nch; ch++) if (x >> ch & 1) edgesBy[ch].push(i);
   }
   $('panel').hidden = false;
   decode();
@@ -426,7 +443,7 @@ function show(d, r, t, keepView = false) {
 // ---- files: save, open, export ----
 const basename = p => String(p).split(/[\\/]/).pop();
 const stamp = () => new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
-const current = () => ({ samples: data, rate, trigIdx, takenAt, names: Array.from({ length: 8 }, (_, ch) => names[ch] || null),
+const current = () => ({ samples: data, rate, trigIdx, takenAt, channels: nch, names: Array.from({ length: 16 }, (_, ch) => names[ch] || null),
   uartOn: [...uartOn], baud: +$('baud').value, buses });
 
 /** Save dialog in the app, a download in a browser. Returns the name saved to, or null if cancelled. */
@@ -483,9 +500,9 @@ async function openCapture() {
 /** Puts a saved capture back exactly as it was: samples, names, UART chips, baud setting and buses. */
 function loadCapture(c, name) {
   running = false;
-  for (let ch = 0; ch < 8; ch++) {
+  for (let ch = 0; ch < 16; ch++) {
     names[ch] = c.names[ch] || '';
-    uartOn[ch] = c.uartOn[ch];
+    uartOn[ch] = !!c.uartOn[ch];
     uartBtns[ch].setAttribute('aria-pressed', uartOn[ch]);
     nameRefresh[ch]();
   }
@@ -537,8 +554,8 @@ function thumb(e) {
   const c = document.createElement('canvas'), dpr = devicePixelRatio || 1, W = 168, H = 34;
   c.width = W * dpr; c.height = H * dpr;
   const g = c.getContext('2d'); g.scale(dpr, dpr);
-  const n = e.samples.length, rowH = H / 8;
-  for (let ch = 0; ch < 8; ch++) {
+  const n = e.samples.length, nc = chOf(e.samples), rowH = H / nc;
+  for (let ch = 0; ch < nc; ch++) {
     g.fillStyle = COLORS[ch];
     const y = ch * rowH, m = 1 << ch;
     for (let x = 0; x < W; x++) {
@@ -605,7 +622,7 @@ function renderMeasure(force = false) {
   const t = n => fmtTime(n / rate);
   const tbody = $('mrows');
   tbody.innerHTML = '';
-  for (let ch = 0; ch < 8; ch++) {
+  for (let ch = 0; ch < nch; ch++) {
     const m = measure(data, ch, i0, i1), tr = document.createElement('tr');
     const cells = m.level !== null
       ? [`<td class="flat" colspan="6">flat ${m.level ? 'high' : 'low'}</td>`]
@@ -633,10 +650,10 @@ function computeCompare() {
   cmp = null;
   if (ref && data && ref.samples !== data) {
     const cur = { samples: data, rate, trigIdx }, tol = +$('ctol').value;
-    const byCh = list => Array.from({ length: 8 }, (_, ch) => list.filter(f => f.ch === ch).map(f => f.byte)); // every byte drawn on the row
+    const byCh = list => Array.from({ length: nch }, (_, ch) => list.filter(f => f.ch === ch).map(f => f.byte)); // every byte drawn on the row
     const curBytes = byCh(items), refBytes = byCh(decodeData(ref.samples, ref.rate).items);
     cmp = { a0: anchor(cur), r0: anchor(ref), k: ref.rate / rate, onTrigger: trigIdx !== null && ref.trigIdx !== null,
-      ch: Array.from({ length: 8 }, (_, ch) => ({ ...diffChannel(cur, ref, ch, tol), bytes: diffBytes(curBytes[ch], refBytes[ch]), nBytes: curBytes[ch].length })) };
+      ch: Array.from({ length: nch }, (_, ch) => ({ ...diffChannel(cur, ref, ch, tol), bytes: diffBytes(curBytes[ch], refBytes[ch]), nBytes: curBytes[ch].length })) };
   }
   renderCompare();
 }
@@ -649,7 +666,7 @@ function renderCompare() {
   $('cref').querySelector('b').textContent = `${ref.source} from ${new Date(ref.takenAt).toLocaleTimeString()}, ${(ref.samples.length / 1024).toFixed(0)}K at ${fmtHz(ref.rate)}`;
   if (!cmp) return;
   $('cref').append(` · aligned on ${cmp.onTrigger ? 'the trigger' : 'the first edge'}`);
-  for (let ch = 0; ch < 8; ch++) {
+  for (let ch = 0; ch < nch; ch++) {
     const c = cmp.ch[ch], tr = document.createElement('tr');
     const wave = c.spans.length ? `<span class="bad">${c.spans.length} difference${c.spans.length > 1 ? 's' : ''}</span>` : '<span class="same">same</span>';
     const longest = c.spans.length ? fmtTime(c.longest / rate) : '–';
@@ -694,7 +711,7 @@ function decodeData(data, rate) {         // shadows the shown capture on purpos
   const items = [], marks = [], summaries = [], slowLines = [];
   {
     uartOn.forEach((on, ch) => {
-      if (!on) return;
+      if (!on || ch >= chOf(data)) return;
       const baud = +$('baud').value || guessBaud(data, ch, rate);
       const frames = baud ? decodeUart(data, ch, rate, baud) : [];
       for (const f of frames) items.push(byteItem(f.start, f.end, ch, f.byte, f.ok ? '' : 'framing error', !f.ok));
@@ -795,7 +812,7 @@ function renderBuses() {
     const pick = (key, text, optional) => {
       const l = document.createElement('label'), sel = document.createElement('select');
       if (optional) sel.add(new Option('—', -1));
-      for (let ch = 0; ch < 8; ch++) sel.add(new Option(label(ch), ch));
+      for (let ch = 0; ch < +$('chans').value; ch++) sel.add(new Option(label(ch), ch));
       sel.value = b[key];
       sel.onchange = () => { b[key] = +sel.value; busesChanged(); };
       l.append(text + ' ', sel);
@@ -822,6 +839,7 @@ function renderBuses() {
   });
 }
 // defaults match examples/pro_micro_buses: I²C on D2/D3, SPI on D4–D7
+$('chans').onchange = renderBuses;      // bus pickers offer the channels being captured
 $('add-i2c').onclick = () => { buses.push({ type: 'i2c', scl: 2, sda: 3 }); busesChanged(); };
 $('add-spi').onclick = () => { buses.push({ type: 'spi', sclk: 4, mosi: 5, miso: 6, cs: 7, mode: 0, msbFirst: true }); busesChanged(); };
 renderBuses();
@@ -878,7 +896,7 @@ function draw() {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, w, h);
   const css = getComputedStyle(document.documentElement);
-  const ruler = parseFloat(css.getPropertyValue('--ruler')), rowH = (h - ruler) / 8;
+  const ruler = parseFloat(css.getPropertyValue('--ruler')), rowH = (h - ruler) / nch;
   const C = n => css.getPropertyValue(n).trim();
 
   // rows
@@ -907,7 +925,7 @@ function draw() {
 
   // waveforms
   const i0 = Math.max(0, Math.floor(iAt(0))), i1 = Math.min(data.length, Math.ceil(iAt(w)) + 1);
-  for (let ch = 0; ch < 8; ch++) {
+  for (let ch = 0; ch < nch; ch++) {
     const y = ruler + ch * rowH, m = 1 << ch;
     const [hi, lo] = decodedRow(ch) ? [y + rowH * 0.12, y + rowH * 0.5] : [y + rowH * 0.24, y + rowH * 0.76];
     ctx.fillStyle = COLORS[ch] + '1c';
@@ -1001,7 +1019,7 @@ function readout() {
   const v = data[i];
   $('r-time').textContent = fmtTime((i - t0()) / rate);
   $('r-idx').textContent = i;
-  $('r-val').textContent = '0x' + v.toString(16).padStart(2, '0').toUpperCase() + '  ' + v.toString(2).padStart(8, '0');
+  $('r-val').textContent = '0x' + v.toString(16).padStart(nch / 4, '0').toUpperCase() + '  ' + v.toString(2).padStart(nch, '0');
   if (marker !== null && markerB === null) showDelta('A→cursor', i - marker);
 }
 function showDelta(what, samples) {
@@ -1031,9 +1049,9 @@ cv.addEventListener('pointerup', e => {
   if (drag && !drag.moved && data) {
     // snap to an edge on the row clicked (any channel's, on the time ruler)
     const ruler = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--ruler'));
-    const row = Math.floor((e.offsetY - ruler) / ((H() - ruler) / 8));
+    const row = Math.floor((e.offsetY - ruler) / ((H() - ruler) / nch));
     const at = Math.round(iAt(e.offsetX));
-    const snapped = nearestEdge(row >= 0 && row < 8 ? edgesBy[row] : edgesAll, at, 6 * view.spp) ?? at;
+    const snapped = nearestEdge(row >= 0 && row < nch ? edgesBy[row] : edgesAll, at, 6 * view.spp) ?? at;
     if (e.shiftKey) markerB = snapped; else marker = snapped;
     if (marker !== null && markerB !== null) showDelta('A→B', markerB - marker);
   }
