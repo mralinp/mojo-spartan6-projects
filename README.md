@@ -98,7 +98,9 @@ cd viewer/src-tauri && cargo run --release
 
 **Channels: 8 or 16.** 16 shows D0–D15; 8 is the default because the hardware then sends one byte per sample
 instead of two, so captures arrive twice as fast. Decoders, measurements, files, history and compare all follow the
-capture's channel count. Older 8-channel `.mojola` files still open.
+capture's channel count. Older 8-channel `.mojola` files still open. Switching to 16 shows D8–D15 right away,
+marked "not in this capture" until you capture again, and opening a capture sets the selector to its channel count.
+Compare only looks at channels both captures have.
 
 **Long capture.** Tick **Long capture** (8 channels) and the analyzer stores only changes: each entry is a value
 and how many samples it lasted (up to 256; longer runs take several entries). A busy line costs entries, idle time
