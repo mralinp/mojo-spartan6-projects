@@ -29,7 +29,7 @@
 
 | Project | What it does | Resources |
 |---|---|---|
-| [**logic_analyzer**](logic_analyzer/) | 8-channel, 200 MHz, 16K-sample logic analyzer. Speaks the SUMP protocol, so PulseView / sigrok work too. | 17% slices, 8 of 32 BRAMs, 1 PLL |
+| [**logic_analyzer**](logic_analyzer/) | 16-channel, 200 MHz, 16K-sample logic analyzer. Speaks the SUMP protocol, so PulseView / sigrok work too. | 16 of 32 BRAMs, 1 PLL |
 | [**viewer**](viewer/) | **Mojo LA**, a desktop app (Tauri + Rust) that captures from the logic analyzer, draws the waveforms and decodes UART. | macOS, Windows, Linux |
 | [**led_counter**](led_counter/) | 8-bit binary counter on the onboard LEDs. The "hello world" that proves the toolchain works. | 1% slices |
 
@@ -62,7 +62,7 @@ The builds aren't code-signed. On macOS, right-click the app and choose **Open**
 
 | | |
 |---|---|
-| Channels | 8 |
+| Channels | 16 (or 8, for twice-as-fast transfers) |
 | Max sample rate | 200 MHz (5 ns), from the Spartan-6 PLL; 100 MHz in PulseView |
 | Memory | 16,384 samples |
 | Trigger | pattern match (mask + value), pre/post-trigger split; holds off until the pre-trigger part is fresh |
@@ -71,19 +71,21 @@ The builds aren't code-signed. On macOS, right-click the app and choose **Open**
 
 </td><td>
 
-| Channel | Pin |
-|---|---|
-| 0 | P51 |
-| 1 | P50 |
-| 2 | P41 |
-| 3 | P40 |
-| 4 | P35 |
-| 5 | P34 |
-| 6 | P33 |
-| 7 | P32 |
+| Channel | Pin | Channel | Pin |
+|---|---|---|---|
+| D0 | P51 | D8 | P30 |
+| D1 | P50 | D9 | P29 |
+| D2 | P41 | D10 | P27 |
+| D3 | P40 | D11 | P26 |
+| D4 | P35 | D12 | P24 |
+| D5 | P34 | D13 | P23 |
+| D6 | P33 | D14 | P22 |
+| D7 | P32 | D15 | P21 |
 
 </td></tr>
 </table>
+
+Pins are the numbers printed next to the Mojo's header holes; D0–D15 run along one header in this order.
 
 > [!WARNING]
 > Inputs are **3.3 V LVTTL and not 5 V tolerant**. Put a level shifter or divider in front of 5 V logic.
@@ -93,6 +95,10 @@ The builds aren't code-signed. On macOS, right-click the app and choose **Open**
 ```bash
 cd viewer/src-tauri && cargo run --release
 ```
+
+**Channels: 8 or 16.** 16 shows D0–D15; 8 is the default because the hardware then sends one byte per sample
+instead of two, so captures arrive twice as fast. Decoders, measurements, files, history and compare all follow the
+capture's channel count. Older 8-channel `.mojola` files still open.
 
 It works like an oscilloscope:
 
@@ -228,7 +234,7 @@ and **+ SPI** buses already match this wiring.
 **Capture with PulseView:** pick the driver *Openbench Logic Sniffer & SUMP compatibles*, serial port
 `/dev/cu.usbmodem*`, then *Scan for devices*. It shows up as **Mojo LA** with 8 channels.
 
-**LEDs:** each edge on a probe lights its LED for 50 ms, so you can see which lines are talking (a busy UART looks
+**LEDs:** each edge on D*n* or D*n*+8 lights LED *n* for 50 ms, so you can see which lines are talking (a busy UART looks
 solidly lit) before you capture. Quiet lines stay dark whatever their level.
 
 **From the command line:**

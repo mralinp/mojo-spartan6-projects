@@ -1,4 +1,4 @@
-// 8-channel SUMP-compatible logic analyzer for the Mojo V3 (Spartan-6 XC6SLX9).
+// 16-channel SUMP-compatible logic analyzer for the Mojo V3 (Spartan-6 XC6SLX9).
 // Host side: PulseView / sigrok-cli, driver "ols" (Openbench Logic Sniffer),
 // over the Mojo's USB serial port (the AVR bridges it to us at 500 kbaud).
 module mojo_top (
@@ -11,9 +11,9 @@ module mojo_top (
     input        avr_tx,       // AVR -> FPGA serial
     output       avr_rx,       // FPGA -> AVR serial
     input        avr_rx_busy,
-    input  [7:0] probe
+    input [15:0] probe
 );
-    localparam AW = 14;                         // 16K samples (8 of 32 BRAMs)
+    localparam AW = 14;                         // 16K samples x 16 channels (16 of 32 BRAMs)
     localparam [31:0] DEPTH = 1 << AW;
     // Reported to SUMP hosts: rates up to 100 MHz keep their standard meaning. 200 MHz
     // needs the demux flag, which only Mojo LA sends.
@@ -45,18 +45,18 @@ module mojo_top (
     assign spi_miso    = 1'bz;
     assign spi_channel = 4'bzzzz;
 
-    reg [7:0] p1, in;                           // 2-FF synchronizer
+    reg [15:0] p1, in;                          // 2-FF synchronizer
     always @(posedge sclk) begin p1 <= probe; in <= p1; end
-    // LEDs show activity: every edge on a probe lights its LED for BLINK cycles,
+    // LEDs show activity: every edge on probe N or N+8 lights LED N for BLINK cycles,
     // so traffic too fast to see (a UART, SPI) shows up as a visible blink.
     localparam BLINK = 10_000_000;              // 50 ms at 200 MHz; tune to taste
-    reg [7:0] in_d;
+    reg [15:0] in_d;
     always @(posedge sclk) in_d <= in;
     genvar g;
     generate for (g = 0; g < 8; g = g + 1) begin : activity
         reg [23:0] t = 0;
         always @(posedge sclk)
-            if (in[g] ^ in_d[g]) t <= BLINK;
+            if ((in[g] ^ in_d[g]) | (in[g + 8] ^ in_d[g + 8])) t <= BLINK;
             else if (t != 0)     t <= t - 1;
         assign led[g] = t != 0;
     end endgenerate
@@ -94,7 +94,7 @@ module mojo_top (
             18: rom = 8'h23;                            // max sample rate
             19: rom = MAX_RATE[31:24]; 20: rom = MAX_RATE[23:16];
             21: rom = MAX_RATE[15:8];  22: rom = MAX_RATE[7:0];
-            23: rom = 8'h40; 24: rom = 8;               // probes
+            23: rom = 8'h40; 24: rom = 16;              // probes
             25: rom = 8'h41; 26: rom = 2;               // protocol version
             default: rom = 0;                           // 27: end
         endcase
@@ -111,7 +111,8 @@ module mojo_top (
     reg [24:0] tick_cnt = 0;
     reg        demux = 0;                       // SUMP flag bit 0: divider counts 200 MHz, not 100 MHz
     reg [15:0] rcount = 0, dcount = 0;          // in units of 4 samples, minus 1
-    reg [7:0]  tmask = 0, tval = 0;
+    reg [15:0] tmask = 0, tval = 0;
+    reg [1:0]  groups = 2'b11;                  // SUMP channel groups to send (flags bits 2/3 disable them)
     reg [AW-1:0] wa = 0, ra = 0;
     reg [18:0] n = 0;
     reg        n_one = 0;                       // n == 1, kept registered for 200 MHz timing
@@ -125,7 +126,7 @@ module mojo_top (
     always @(posedge sclk) every <= demux && div == 0;
     // One pipeline stage for 200 MHz: the sample and whether it matches the trigger,
     // registered together so they stay aligned.
-    reg [7:0] samp = 0;
+    reg [15:0] samp = 0;
     reg       trig = 0;
     always @(posedge sclk) begin
         samp <= in;
@@ -141,8 +142,9 @@ module mojo_top (
     reg         pre_ok = 0;
     always @(posedge sclk) pre_need <= (rcount > dcount) ? (rcount - dcount) * 4 : 0;
 
-    reg [7:0] mem [0:DEPTH-1];
-    reg [7:0] q;
+    reg [15:0] mem [0:DEPTH-1];
+    reg [15:0] q;
+    reg        hi_byte = 0;                     // sending a sample's second group
     always @(posedge sclk) begin
         if (we) mem[wa] <= samp;
         q <= mem[ra];
@@ -183,24 +185,33 @@ module mojo_top (
                         state <= LOAD;
                     end
                 end
-                LOAD: state <= SEND;            // wait out BRAM read latency
-                SEND: if (tx_ok) begin          // SUMP sends newest sample first
-                    tx_data  <= q;
+                LOAD: begin                     // wait out BRAM read latency
+                    hi_byte <= !groups[0];      // group 0 disabled: start with group 1
+                    state   <= SEND;
+                end
+                SEND: if (tx_ok) begin          // SUMP sends newest sample first, enabled groups low first
+                    tx_data  <= hi_byte ? q[15:8] : q[7:0];
                     tx_start <= 1;
-                    ra       <= ra - 1;
-                    n        <= n - 1;
-                    n_one    <= n == 2;
-                    state    <= n_one ? IDLE : LOAD;
+                    if (!hi_byte && groups[1]) hi_byte <= 1;
+                    else begin
+                        ra    <= ra - 1;
+                        n     <= n - 1;
+                        n_one <= n == 2;
+                        state <= n_one ? IDLE : LOAD;
+                    end
                 end
             endcase
 
             // Commands: bit 7 clear = 1 byte; set = 1 byte + 4 little-endian arg bytes.
             if (do_long) case (cmd)
                 8'h80: div <= arg[23:0];
-                8'h82: demux <= arg[0];
+                8'h82: begin                    // flags: demux, and channel groups 0/1 disabled
+                    demux  <= arg[0];
+                    groups <= (~arg[3:2] == 2'b00) ? 2'b01 : ~arg[3:2];   // never send nothing
+                end
                 8'h81: {dcount, rcount} <= arg;
-                8'hC0: tmask <= arg[7:0];
-                8'hC1: tval  <= arg[7:0];
+                8'hC0: tmask <= arg[15:0];
+                8'hC1: tval  <= arg[15:0];
                 default: ;                      // other flags, other trigger stages: ignored
             endcase
 

@@ -13,7 +13,23 @@ const cap = {
 // round trip, including more than one 32K chunk of base64 input
 const back = parseCapture(serializeCapture(cap));
 assert.deepStrictEqual(back.samples, samples);
-for (const k of ['rate', 'trigIdx', 'takenAt', 'names', 'uartOn', 'baud', 'buses']) assert.deepStrictEqual(back[k], cap[k], k);
+for (const k of ['rate', 'trigIdx', 'takenAt', 'baud', 'buses']) assert.deepStrictEqual(back[k], cap[k], k);
+// names and UART chips come back padded to 16 channels
+assert.deepStrictEqual(back.names, [...cap.names, ...Array(8).fill(null)]);
+assert.deepStrictEqual(back.uartOn, [...cap.uartOn, ...Array(8).fill(false)]);
+assert.ok(back.samples instanceof Uint8Array);
+
+// 16 channels: 16-bit samples survive the round trip, and VCD/CSV get 16 wires/columns
+const wide = new Uint16Array(5000);
+for (let i = 0; i < wide.length; i++) wide[i] = (i * 2654435761) >>> 16;
+const back16 = parseCapture(serializeCapture({ ...cap, samples: wide }));
+assert.ok(back16.samples instanceof Uint16Array);
+assert.deepStrictEqual(Array.from(back16.samples), Array.from(wide));
+const v16 = toVCD({ samples: Uint16Array.from([0, 0x8000]), rate: 1e6, trigIdx: null, takenAt: 't' }, ch => `D${ch}`).split('\n');
+assert.ok(v16.includes('$var wire 1 P D15 $end'));
+assert.ok(v16.includes('1P'));
+assert.strictEqual(toCSV({ samples: Uint16Array.from([0x8001]), rate: 1e6, trigIdx: null }, ch => `D${ch}`).split('\n')[1],
+  '0.000000000,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1');
 
 // readable errors for files we can't open
 assert.throws(() => parseCapture('not json'), /isn't JSON/);
@@ -23,7 +39,7 @@ assert.throws(() => parseCapture(JSON.stringify({ format: 'mojo-la-capture', ver
 // a trigger outside the samples is dropped, missing fields get defaults
 const loose = parseCapture(JSON.stringify({ format: 'mojo-la-capture', version: 1, rate: 1e6, samples: 'AAE=', trigIdx: 99 }));
 assert.strictEqual(loose.trigIdx, null);
-assert.deepStrictEqual(loose.uartOn, Array(8).fill(false));
+assert.deepStrictEqual(loose.uartOn, Array(16).fill(false));
 
 // VCD: 4 samples at 200 MHz (5 ns), D0 toggling, D1 high from sample 2
 const label = ch => cap.names[ch] || `D${ch}`;

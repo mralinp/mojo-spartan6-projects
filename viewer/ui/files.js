@@ -1,8 +1,11 @@
 // Capture files (.mojola) and VCD / CSV export. Pure functions, so Node can test them.
-// A capture: {samples: Uint8Array, rate, trigIdx (or null), takenAt (ISO time), names[8],
-//             uartOn[8], baud (0 = auto), buses}
+// A capture: {samples: Uint8Array (8 channels) or Uint16Array (16), rate, trigIdx (or null),
+//             takenAt (ISO time), names[16], uartOn[16], baud (0 = auto), buses}
 
 const CAPTURE_FORMAT = 'mojo-la-capture';
+const channelsOf = s => s instanceof Uint16Array ? 16 : 8;
+// 16-bit samples are stored as their bytes, little-endian like the hardware sends them
+const bytesOf = s => s instanceof Uint16Array ? new Uint8Array(s.buffer, s.byteOffset, s.byteLength) : s;
 
 function toB64(u8) {
   let s = '';
@@ -18,7 +21,7 @@ function fromB64(b) {
 function serializeCapture(c) {
   return JSON.stringify({
     format: CAPTURE_FORMAT, version: 1, takenAt: c.takenAt, rate: c.rate, trigIdx: c.trigIdx,
-    names: c.names, uartOn: c.uartOn, baud: c.baud, buses: c.buses, samples: toB64(c.samples),
+    channels: channelsOf(c.samples), names: c.names, uartOn: c.uartOn, baud: c.baud, buses: c.buses, samples: toB64(bytesOf(c.samples)),
   }, null, 1);
 }
 
@@ -28,9 +31,10 @@ function parseCapture(text) {
   try { o = JSON.parse(text); } catch { throw new Error('This file isn\'t a Mojo LA capture (it isn\'t JSON).'); }
   if (o?.format !== CAPTURE_FORMAT) throw new Error('This file isn\'t a Mojo LA capture.');
   if (o.version > 1) throw new Error(`This capture was saved by a newer Mojo LA (format ${o.version}). Update the app to open it.`);
-  const samples = fromB64(o.samples || '');
-  if (!samples.length || !(o.rate > 0)) throw new Error('This capture file is damaged: it has no samples or no sample rate.');
-  const eight = (a, fill) => Array.from({ length: 8 }, (_, i) => Array.isArray(a) && a[i] !== undefined ? a[i] : fill);
+  const bytes = fromB64(o.samples || ''), wide = o.channels === 16;   // files without a channel count are 8-channel
+  if (!bytes.length || !(o.rate > 0) || wide && bytes.length % 2) throw new Error('This capture file is damaged: it has no samples or no sample rate.');
+  const samples = wide ? new Uint16Array(bytes.buffer, 0, bytes.length / 2) : bytes;
+  const eight = (a, fill) => Array.from({ length: 16 }, (_, i) => Array.isArray(a) && a[i] !== undefined ? a[i] : fill);
   return {
     samples, rate: o.rate, takenAt: o.takenAt || null,
     trigIdx: Number.isInteger(o.trigIdx) && o.trigIdx >= 0 && o.trigIdx < samples.length ? o.trigIdx : null,
@@ -43,7 +47,7 @@ const vcdName = s => String(s).replace(/[^A-Za-z0-9_]+/g, '_') || 'ch';
 
 /** VCD with a 1 ns timescale (every rate divides 1 GHz). `label(ch)` names each wire. */
 function toVCD(c, label) {
-  const per = Math.round(1e9 / c.rate), s = c.samples, ids = 'ABCDEFGH';
+  const per = Math.round(1e9 / c.rate), s = c.samples, ids = 'ABCDEFGHIJKLMNOP', n = channelsOf(s);
   const out = [
     `$date ${c.takenAt || new Date().toISOString()} $end`,
     '$version Mojo LA $end',
@@ -51,15 +55,15 @@ function toVCD(c, label) {
     '$timescale 1ns $end',
     '$scope module mojo_la $end',
   ];
-  for (let ch = 0; ch < 8; ch++) out.push(`$var wire 1 ${ids[ch]} ${vcdName(label(ch))} $end`);
+  for (let ch = 0; ch < n; ch++) out.push(`$var wire 1 ${ids[ch]} ${vcdName(label(ch))} $end`);
   out.push('$upscope $end', '$enddefinitions $end', '#0', '$dumpvars');
-  for (let ch = 0; ch < 8; ch++) out.push(`${(s[0] >> ch) & 1}${ids[ch]}`);
+  for (let ch = 0; ch < n; ch++) out.push(`${(s[0] >> ch) & 1}${ids[ch]}`);
   out.push('$end');
   for (let i = 1; i < s.length; i++) {
     const diff = s[i] ^ s[i - 1];
     if (!diff) continue;
     out.push(`#${i * per}`);
-    for (let ch = 0; ch < 8; ch++) if ((diff >> ch) & 1) out.push(`${(s[i] >> ch) & 1}${ids[ch]}`);
+    for (let ch = 0; ch < n; ch++) if ((diff >> ch) & 1) out.push(`${(s[i] >> ch) & 1}${ids[ch]}`);
   }
   out.push(`#${s.length * per}`);
   return out.join('\n') + '\n';
@@ -69,11 +73,11 @@ const csvField = v => /[",\n]/.test(v) ? `"${String(v).replace(/"/g, '""')}"` : 
 
 /** One row per sample: time in seconds from the trigger (or the first sample), then each channel's 0/1. */
 function toCSV(c, label) {
-  const s = c.samples, t0 = c.trigIdx ?? 0;
-  const rows = [['time_s', ...Array.from({ length: 8 }, (_, ch) => label(ch))].map(csvField).join(',')];
+  const s = c.samples, t0 = c.trigIdx ?? 0, n = channelsOf(s);
+  const rows = [['time_s', ...Array.from({ length: n }, (_, ch) => label(ch))].map(csvField).join(',')];
   for (let i = 0; i < s.length; i++) {
     let row = ((i - t0) / c.rate).toFixed(9);
-    for (let ch = 0; ch < 8; ch++) row += ',' + ((s[i] >> ch) & 1);
+    for (let ch = 0; ch < n; ch++) row += ',' + ((s[i] >> ch) & 1);
     rows.push(row);
   }
   return rows.join('\n') + '\n';
