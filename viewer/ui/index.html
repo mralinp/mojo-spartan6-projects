@@ -78,7 +78,7 @@
   #measure { overflow: auto; min-height: 0; }
   #history { overflow: auto; min-height: 0; }
   #hlist { list-style: none; margin: 0; padding: 4px 0; }
-  #hlist li { display: grid; grid-template-columns: 168px 1fr auto auto; align-items: center; gap: 14px; padding: 4px 14px;
+  #hlist li { display: grid; grid-template-columns: 168px 1fr auto auto auto; align-items: center; gap: 14px; padding: 4px 14px;
     border-bottom: 1px solid var(--grid); cursor: pointer; font-size: 12px; }
   #hlist li:hover { background: var(--grid); }
   #hlist li[aria-current="true"] { box-shadow: inset 3px 0 0 var(--accent-hi); background: var(--grid); }
@@ -89,6 +89,19 @@
   #hlist button[aria-pressed="true"] { color: #f2cc4c; border-color: #f2cc4c; }
   #hlist .empty { display: block; color: var(--dim); cursor: default; padding: 10px 14px; }
   #hcount { color: var(--dim); font-weight: 400; }
+  #compare { overflow: auto; min-height: 0; }
+  #compare .cbar { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; padding: 6px 14px; border-bottom: 1px solid var(--line); font-size: 12px; color: var(--dim); }
+  #compare .cbar b { color: var(--fg); }
+  #compare .cbar button, #compare .cbar select { font-size: 12px; padding: 2px 8px; }
+  #cref { flex: 1; min-width: 0; }
+  #compare table { border-collapse: collapse; width: 100%; font: 12px/1.6 var(--mono); }
+  #compare th { position: sticky; top: 0; background: var(--panel); font: 600 10px var(--ui); text-transform: uppercase; letter-spacing: .06em; color: var(--dim); text-align: left; padding: 6px 14px 4px; border-bottom: 1px solid var(--line); }
+  #compare td { padding: 2px 14px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+  #compare tr.diff { cursor: pointer; }
+  #compare tr.diff:hover { background: var(--grid); }
+  #compare .bad { color: #ff8a8f; }
+  #compare .same { color: var(--dim); }
+  #hlist li.ref { box-shadow: inset 3px 0 0 #f2cc4c; }
   #measure table { border-collapse: collapse; width: 100%; font: 12px/1.6 var(--mono); font-variant-numeric: tabular-nums; }
   #measure th { position: sticky; top: 0; background: var(--panel); font: 600 10px var(--ui); text-transform: uppercase;
     letter-spacing: .06em; color: var(--dim); text-align: right; padding: 6px 14px 4px; border-bottom: 1px solid var(--line); }
@@ -160,6 +173,7 @@
     <button role="tab" id="tab-measure" aria-selected="true" aria-controls="measure">Measurements</button>
     <button role="tab" id="tab-dump" aria-selected="false" aria-controls="dump">Decoded</button>
     <button role="tab" id="tab-history" aria-selected="false" aria-controls="history">History <span id="hcount"></span></button>
+    <button role="tab" id="tab-compare" aria-selected="false" aria-controls="compare">Compare</button>
     <label class="scope" id="scope-wrap">Over <select id="scope"><option value="all">whole capture</option><option value="view">visible window</option></select></label>
   </div>
   <div id="measure" role="tabpanel" aria-labelledby="tab-measure">
@@ -169,6 +183,17 @@
     </table>
   </div>
   <div id="history" role="tabpanel" aria-labelledby="tab-history" hidden><ol id="hlist"></ol></div>
+  <div id="compare" role="tabpanel" aria-labelledby="tab-compare" hidden>
+    <div class="cbar">
+      <span id="cref">Pick a capture in History and press <b>Compare</b> to use it as the reference.</span>
+      <label>Tolerance <select id="ctol"></select></label>
+      <button id="cclear">Stop comparing</button>
+    </div>
+    <table>
+      <thead><tr><th>Channel</th><th>Waveform</th><th>Longest difference</th><th>Decoded bytes</th></tr></thead>
+      <tbody id="crows"></tbody>
+    </table>
+  </div>
   <div id="dump" role="tabpanel" aria-labelledby="tab-dump" hidden>
     <div class="bar">
       <div id="streams"></div>
@@ -195,6 +220,7 @@
 <script src="measure.js"></script>
 <script src="buses.js"></script>
 <script src="files.js"></script>
+<script src="compare.js"></script>
 <script>
 // Probe-lead colours, as on Saleae/sigrok harnesses: black, brown, red, orange, yellow, green, blue, violet.
 const COLORS = ['#a3a9b2', '#c08a5c', '#ef4f57', '#f2913f', '#f2cc4c', '#4cb764', '#4c96f7', '#a77ce6'];
@@ -210,6 +236,7 @@ const $ = id => document.getElementById(id);
 const cv = $('cv'), ctx = cv.getContext('2d');
 
 let data = null, rate = 1e6, trigIdx = null, takenAt = null;
+let ref = null, cmp = null;               // compare: the reference history entry, and results for what's on screen
 let view = { start: 0, spp: 1 };          // first visible sample, samples per CSS pixel
 let hoverX = null, marker = null, markerB = null; // A: click, B: shift-click
 let edgesAll = [], edgesBy = [];          // edges on any channel / per channel, for marker snapping
@@ -269,7 +296,7 @@ for (let ch = 0; ch < 8; ch++) {
     const finish = keep => {
       if (done) return; done = true;
       if (keep) { names[ch] = input.value.trim(); saveNames(); }
-      input.replaceWith(nm); showName(); renderBuses(); renderDump(); renderMeasure(true); nm.focus();
+      input.replaceWith(nm); showName(); renderBuses(); renderDump(); renderMeasure(true); renderCompare(); nm.focus();
     };
     // preventDefault: otherwise this Enter also clicks the name button that gets focus back, reopening the editor
     input.onkeydown = e => {
@@ -534,7 +561,9 @@ function renderHistory() {
     li.title = 'View this capture';
     li.innerHTML = `<span></span><span><span class="when"></span> <span class="meta"></span></span>
       <button class="pin" aria-pressed="${e.pinned}" title="Pin: keep it, even after restarting">${e.pinned ? '★ Pinned' : '☆ Pin'}</button>
-      <button class="save" title="Save as a .mojola file">Save</button>`;
+      <button class="save" title="Save as a .mojola file">Save</button>
+      <button class="cmp" aria-pressed="${ref === e}" title="Compare what's on screen against this capture">${ref === e ? 'Reference' : 'Compare'}</button>`;
+    if (ref === e) li.classList.add('ref');
     li.children[0].append(thumb(e));
     li.querySelector('.when').textContent = new Date(e.takenAt).toLocaleTimeString();
     li.querySelector('.meta').textContent = `${e.source} · ${(e.samples.length / 1024).toFixed(0)}K at ${fmtHz(e.rate)}` +
@@ -546,6 +575,7 @@ function renderHistory() {
       if (!savePinned()) { e.pinned = false; savePinned(); status('Couldn\'t keep the pin: browser storage is full. Save it as a file instead.', true); }
       renderHistory();
     };
+    li.querySelector('.cmp').onclick = ev => { ev.stopPropagation(); setReference(ref === e ? null : e); };
     li.querySelector('.save').onclick = async ev => {
       ev.stopPropagation();
       try {
@@ -590,8 +620,58 @@ function renderMeasure(force = false) {
     tbody.append(tr);
   }
 }
+// ---- compare against a reference capture ----
+const TOLERANCES = [0, 1, 2, 5, 10, 20, 50];
+fill($('ctol'), TOLERANCES, t => `${t} sample${t === 1 ? '' : 's'}`, 2);
+function setReference(e) {
+  ref = e;
+  if (e && e.samples === data) { ref = null; status('That\'s the capture on screen. View another one, then compare against this.', true); }
+  renderHistory(); computeCompare(); draw();
+  if (ref) { selectTab('compare'); status(`Comparing against ${ref.source} from ${new Date(ref.takenAt).toLocaleTimeString()}`); }
+}
+function computeCompare() {
+  cmp = null;
+  if (ref && data && ref.samples !== data) {
+    const cur = { samples: data, rate, trigIdx }, tol = +$('ctol').value;
+    const byCh = list => Array.from({ length: 8 }, (_, ch) => list.filter(f => f.ch === ch).map(f => f.byte)); // every byte drawn on the row
+    const curBytes = byCh(items), refBytes = byCh(decodeData(ref.samples, ref.rate).items);
+    cmp = { a0: anchor(cur), r0: anchor(ref), k: ref.rate / rate, onTrigger: trigIdx !== null && ref.trigIdx !== null,
+      ch: Array.from({ length: 8 }, (_, ch) => ({ ...diffChannel(cur, ref, ch, tol), bytes: diffBytes(curBytes[ch], refBytes[ch]), nBytes: curBytes[ch].length })) };
+  }
+  renderCompare();
+}
+function renderCompare() {
+  $('tab-compare').textContent = cmp ? `Compare (${cmp.ch.reduce((n, c) => n + c.spans.length + c.bytes.changed.length + (c.bytes.extra ? 1 : 0), 0)})` : 'Compare';
+  const tbody = $('crows');
+  tbody.innerHTML = '';
+  if (!ref) { $('cref').innerHTML = 'Pick a capture in History and press <b>Compare</b> to use it as the reference.'; return; }
+  $('cref').innerHTML = 'Reference: <b></b>';
+  $('cref').querySelector('b').textContent = `${ref.source} from ${new Date(ref.takenAt).toLocaleTimeString()}, ${(ref.samples.length / 1024).toFixed(0)}K at ${fmtHz(ref.rate)}`;
+  if (!cmp) return;
+  $('cref').append(` · aligned on ${cmp.onTrigger ? 'the trigger' : 'the first edge'}`);
+  for (let ch = 0; ch < 8; ch++) {
+    const c = cmp.ch[ch], tr = document.createElement('tr');
+    const wave = c.spans.length ? `<span class="bad">${c.spans.length} difference${c.spans.length > 1 ? 's' : ''}</span>` : '<span class="same">same</span>';
+    const longest = c.spans.length ? fmtTime(c.longest / rate) : '–';
+    const b = c.bytes;
+    const bytes = !c.nBytes && !b.extra ? '<span class="same">–</span>'
+      : b.changed.length || b.extra
+        ? `<span class="bad">${b.changed.length} of ${Math.min(c.nBytes, c.nBytes - b.extra)} differ${b.changed.length ? `, first #${b.changed[0].i + 1}: ${hex(b.changed[0].cur)} vs ${hex(b.changed[0].ref)}` : ''}${b.extra ? `; ${Math.abs(b.extra)} ${b.extra > 0 ? 'more' : 'fewer'} than the reference` : ''}</span>`
+        : `<span class="same">all ${c.nBytes} match</span>`;
+    tr.innerHTML = `<td><span class="sw" style="background:${COLORS[ch]}"></span><span class="n"></span></td><td>${wave}</td><td>${longest}</td><td>${bytes}</td>`;
+    tr.querySelector('.n').textContent = label(ch);
+    if (c.spans.length) {
+      tr.className = 'diff'; tr.title = 'Show the first difference';
+      tr.onclick = () => { const s0 = c.spans[0]; zoomTo(s0.start - 20, s0.end + 20); };
+    }
+    tbody.append(tr);
+  }
+}
+$('ctol').onchange = () => { computeCompare(); draw(); };
+$('cclear').onclick = () => setReference(null);
+
 function selectTab(which) {
-  for (const [tab, panel] of [['tab-measure', 'measure'], ['tab-dump', 'dump'], ['tab-history', 'history']]) {
+  for (const [tab, panel] of [['tab-measure', 'measure'], ['tab-dump', 'dump'], ['tab-history', 'history'], ['tab-compare', 'compare']]) {
     const on = panel === which;
     $(tab).setAttribute('aria-selected', on); $(panel).hidden = !on;
   }
@@ -600,6 +680,7 @@ function selectTab(which) {
 $('tab-measure').onclick = () => selectTab('measure');
 $('tab-dump').onclick = () => selectTab('dump');
 $('tab-history').onclick = () => selectTab('history');
+$('tab-compare').onclick = () => selectTab('compare');
 $('scope').onchange = () => renderMeasure(true);
 
 // ---- decoding ----
@@ -608,9 +689,10 @@ const hex = b => b.toString(16).padStart(2, '0').toUpperCase();
 const byteItem = (start, end, ch, byte, note = '', bad = false) =>
   ({ start, end, ch, byte, long: `${hex(byte)} ${esc(byte)}`, short: hex(byte), chr: esc(byte), note, bad, listed: true });
 
-function decode() {
-  items = []; marks = []; summaries = []; slowLines = [];
-  if (data) {
+/** Runs every decoder (UART chips, I²C and SPI buses) over any capture's samples. */
+function decodeData(data, rate) {         // shadows the shown capture on purpose: decodes the one passed in
+  const items = [], marks = [], summaries = [], slowLines = [];
+  {
     uartOn.forEach((on, ch) => {
       if (!on) return;
       const baud = +$('baud').value || guessBaud(data, ch, rate);
@@ -651,7 +733,12 @@ function decode() {
     }
   }
   items.sort((a, b) => a.start - b.start);
+  return { items, marks, summaries, slowLines };
+}
+function decode() {
+  ({ items, marks, summaries, slowLines } = data ? decodeData(data, rate) : { items: [], marks: [], summaries: [], slowLines: [] });
   renderDump();
+  computeCompare();
 }
 
 function renderDump() {
@@ -840,6 +927,28 @@ function draw() {
     ctx.lineTo(xOf(i1), prev ? hi : lo);
     if (prev) highRun(runStart, i1);
     ctx.strokeStyle = COLORS[ch]; ctx.lineWidth = 1.5; ctx.lineJoin = 'miter'; ctx.stroke();
+
+    // the reference, dashed, on the same time axis, and red bands where the two disagree
+    if (cmp) {
+      for (const sp of cmp.ch[ch].spans) {
+        const x0 = xOf(sp.start), x1 = xOf(sp.end);
+        if (x1 < 0 || x0 > w) continue;
+        ctx.fillStyle = '#ef4f5740'; ctx.fillRect(x0, y + 1, Math.max(x1 - x0, 2), rowH - 2);
+      }
+      const rs = ref.samples, toCur = j => cmp.a0 + (j - cmp.r0) / cmp.k;
+      const j0 = Math.max(0, Math.floor(cmp.r0 + (i0 - cmp.a0) * cmp.k)), j1 = Math.min(rs.length - 1, Math.ceil(cmp.r0 + (i1 - cmp.a0) * cmp.k));
+      if (j0 < j1) {
+        ctx.save(); ctx.beginPath(); ctx.setLineDash([3, 3]); ctx.lineWidth = 1; ctx.strokeStyle = '#ffffffa0';
+        let p = rs[j0] & m;
+        ctx.moveTo(xOf(toCur(j0)), p ? hi : lo);
+        for (let j = j0 + 1; j <= j1; j++) {
+          const b = rs[j] & m;
+          if (b !== p) { const x = xOf(toCur(j)); ctx.lineTo(x, p ? hi : lo); ctx.lineTo(x, b ? hi : lo); p = b; }
+        }
+        ctx.lineTo(xOf(toCur(j1)), p ? hi : lo);
+        ctx.stroke(); ctx.restore();
+      }
+    }
 
     // decoded bytes in the band under the trace
     if (!decodedRow(ch)) continue;
