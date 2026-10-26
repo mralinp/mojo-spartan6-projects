@@ -32,7 +32,11 @@ jobs:
           workspaces: viewer/src-tauri
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
+      - name: sigrok-cli, for the decoder round trip
+        run: brew install sigrok-cli
       - run: cargo test
+        env:
+          MOJO_NEED_SIGROK: 1
       - name: UART decoder and measurements
         run: |
           node ../ui/uart.test.js
@@ -42,6 +46,7 @@ jobs:
           node ../ui/compare.test.js
           node ../ui/rle.test.js
           node ../ui/livelog.test.js
+          node ../ui/sigrok.test.js
       - name: logic analyzer testbench
         working-directory: logic_analyzer
         run: |

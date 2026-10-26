@@ -478,13 +478,337 @@ fn read_text(path: String) -> Result<String, String> {
     std::fs::read_to_string(&p).map_err(|e| format!("Couldn't open {}: {e}", p.display()))
 }
 
+// ---- sigrok decoders: every protocol libsigrokdecode knows, through an installed sigrok-cli ----
+// sigrok is GPL-3, so it stays a separate program: we run it, never bundle or link it.
+
+/// sigrok-cli on PATH, or where its installers put it (apps started from the Dock don't get the shell's PATH).
+fn sigrok_cli() -> Option<std::path::PathBuf> {
+    let exe = if cfg!(windows) {
+        "sigrok-cli.exe"
+    } else {
+        "sigrok-cli"
+    };
+    let fixed = [
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        r"C:\Program Files\sigrok\sigrok-cli",
+        r"C:\Program Files (x86)\sigrok\sigrok-cli",
+    ];
+    std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .chain(fixed.iter().map(Into::into))
+        .map(|d| d.join(exe))
+        .find(|p| p.is_file())
+}
+
+#[derive(serde::Serialize, Clone, Debug, Default, PartialEq)]
+struct PdChannel {
+    id: String,
+    name: String,
+    desc: String,
+}
+
+#[derive(serde::Serialize, Clone, Debug, Default, PartialEq)]
+struct PdOption {
+    id: String,
+    desc: String,
+    default: String,
+    values: Vec<String>,
+}
+
+/// One decoder, from `sigrok-cli -P <id> --show`.
+#[derive(serde::Serialize, Clone, Debug, Default, PartialEq)]
+struct Decoder {
+    id: String,
+    name: String,
+    longname: String,
+    desc: String,
+    inputs: Vec<String>,
+    outputs: Vec<String>,
+    required: Vec<PdChannel>,
+    optional: Vec<PdChannel>,
+    options: Vec<PdOption>,
+    /// Annotation row names, as the decoder output labels them (class ids for decoders without rows).
+    rows: Vec<String>,
+}
+
+fn parse_show(text: &str) -> Decoder {
+    let mut d = Decoder::default();
+    let mut classes = vec![];
+    let mut section = "";
+    for line in text.lines() {
+        if let Some(item) = line.strip_prefix("- ") {
+            // "id (Name): desc" for channels and rows, "id: desc (values, default x)" for options, "id" for in/outputs
+            let (head, rest) = item.split_once(": ").unwrap_or((item, ""));
+            let (id, name) = match head.split_once(" (") {
+                Some((i, n)) => (i, n.trim_end_matches(')')),
+                None => (head, head),
+            };
+            let ch = || PdChannel {
+                id: id.into(),
+                name: name.into(),
+                desc: rest.into(),
+            };
+            match section {
+                "Possible decoder input IDs" => d.inputs.push(id.into()),
+                "Possible decoder output IDs" => d.outputs.push(id.into()),
+                "Required channels" => d.required.push(ch()),
+                "Optional channels" => d.optional.push(ch()),
+                "Annotation rows" => d.rows.push(name.into()),
+                "Annotation classes" => classes.push(id.to_string()),
+                "Options" => {
+                    let mut o = PdOption {
+                        id: id.into(),
+                        desc: rest.into(),
+                        ..Default::default()
+                    };
+                    if let Some(at) = rest
+                        .rfind(" (")
+                        .filter(|&at| rest[at..].contains("default "))
+                    {
+                        o.desc = rest[..at].into();
+                        for v in rest[at + 2..].trim_end_matches(')').split(", ") {
+                            let unq = |v: &str| v.trim_matches('\'').to_string();
+                            match v.strip_prefix("default ") {
+                                Some(def) => o.default = unq(def),
+                                None => o.values.push(unq(v)),
+                            }
+                        }
+                    }
+                    d.options.push(o);
+                }
+                _ => {}
+            }
+        } else if let Some((key, val)) = line.split_once(':') {
+            section = key;
+            let val = val.trim().to_string();
+            match key {
+                "ID" => d.id = val,
+                "Name" => d.name = val,
+                "Long name" => d.longname = val,
+                "Description" => d.desc = val,
+                _ => {}
+            }
+        }
+    }
+    if d.rows.is_empty() {
+        d.rows = classes; // no rows: sigrok labels each annotation with its class
+    }
+    d
+}
+
+static CATALOG: Mutex<Option<Vec<Decoder>>> = Mutex::new(None);
+
+/// Every installed decoder, sorted by id. Read once per run (about a second), then cached.
+#[tauri::command]
+async fn sigrok_decoders() -> Result<Vec<Decoder>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        if let Some(c) = CATALOG.lock().unwrap().clone() {
+            return Ok(c);
+        }
+        let cli = sigrok_cli().ok_or("sigrok-cli isn't installed.")?;
+        let run = |args: &[&str]| {
+            std::process::Command::new(&cli)
+                .args(args)
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .map_err(|e| format!("Couldn't run sigrok-cli: {e}"))
+        };
+        let list = run(&["-L"])?;
+        let ids: Vec<String> = list
+            .lines()
+            .skip_while(|l| !l.starts_with("Supported protocol decoders"))
+            .skip(1)
+            .take_while(|l| l.starts_with("  "))
+            .filter_map(|l| l.split_whitespace().next().map(String::from))
+            .collect();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let found = Mutex::new(vec![]);
+        std::thread::scope(|sc| {
+            for _ in 0..8 {
+                sc.spawn(|| {
+                    while let Some(id) = ids.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        if let Ok(t) = run(&["-P", id, "--show"]) {
+                            let d = parse_show(&t);
+                            if d.id == *id {
+                                found.lock().unwrap().push(d);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        let mut c = found.into_inner().unwrap();
+        c.sort_by(|a, b| a.id.cmp(&b.id));
+        if c.is_empty() {
+            return Err("sigrok-cli lists no protocol decoders.".into());
+        }
+        *CATALOG.lock().unwrap() = Some(c.clone());
+        Ok(c)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// One decoder in a stack: the first gets channels, the rest read the one before.
+#[derive(serde::Deserialize, Clone, Debug)]
+struct PdSpec {
+    id: String,
+    #[serde(default)]
+    channels: std::collections::BTreeMap<String, u8>,
+    #[serde(default)]
+    options: std::collections::BTreeMap<String, String>,
+}
+
+/// sigrok-cli's -P argument: `uart:rx=1:baudrate=9600,midi`. Its separators can't appear in values.
+fn pd_arg(stack: &[PdSpec]) -> Result<String, String> {
+    let ok = |s: &str| !s.is_empty() && !s.contains([':', ',', '=']) && !s.starts_with('-');
+    let mut parts = vec![];
+    for pd in stack {
+        if !ok(&pd.id) {
+            return Err(format!("Bad decoder name {:?}", pd.id));
+        }
+        let mut p = pd.id.clone();
+        for (k, ch) in &pd.channels {
+            p += &format!(":{k}={ch}");
+        }
+        for (k, v) in &pd.options {
+            if !ok(k) || !ok(v) {
+                return Err(format!("{}: option {k} can't be {v:?}", pd.id));
+            }
+            p += &format!(":{k}={v}");
+        }
+        parts.push(p);
+    }
+    if parts.is_empty() {
+        return Err("No decoder given.".into());
+    }
+    Ok(parts.join(","))
+}
+
+/// A decoder annotation in samples: `pd` is the decoder ("uart-1"), `row` the annotation row's name.
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+struct Ann {
+    pd: String,
+    row: String,
+    start: u64,
+    end: u64,
+    text: String,
+}
+
+/// sigrok-cli's --protocol-decoder-jsontrace output (begin/end events in microseconds) as annotations.
+fn parse_trace(json: &str, rate: f64) -> Result<Vec<Ann>, String> {
+    if json.trim().is_empty() {
+        return Ok(vec![]);
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("sigrok-cli output: {e}"))?;
+    let str_of = |e: &serde_json::Value, k: &str| e[k].as_str().unwrap_or("").to_string();
+    let at = |e: &serde_json::Value| {
+        (e["ts"].as_f64().unwrap_or(0.0) * rate / 1e6)
+            .round()
+            .max(0.0) as u64
+    };
+    let mut open: std::collections::HashMap<(String, String), Vec<(u64, String)>> =
+        Default::default();
+    let mut out = vec![];
+    for e in v["traceEvents"].as_array().into_iter().flatten() {
+        let key = (str_of(e, "pid"), str_of(e, "tid"));
+        match e["ph"].as_str() {
+            Some("B") => open
+                .entry(key)
+                .or_default()
+                .push((at(e), str_of(e, "name"))),
+            Some("E") => {
+                if let Some((start, text)) = open.get_mut(&key).and_then(Vec::pop) {
+                    out.push(Ann {
+                        pd: key.0,
+                        row: key.1,
+                        start,
+                        end: at(e),
+                        text,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    out.sort_by_key(|a| a.start);
+    Ok(out)
+}
+
+/// Runs a decoder stack over samples: one byte per sample for 8 channels, two (little-endian) for 16.
+fn sigrok_run(
+    samples: &[u8],
+    channels: u8,
+    rate: u64,
+    stack: &[PdSpec],
+) -> Result<Vec<Ann>, String> {
+    use std::process::{Command, Stdio};
+    let cli = sigrok_cli().ok_or("sigrok-cli isn't installed.")?;
+    let input = format!("binary:numchannels={channels}:samplerate={rate}");
+    let mut child = Command::new(cli)
+        .args([
+            "-I",
+            &input,
+            "-i",
+            "-",
+            "-P",
+            &pd_arg(stack)?,
+            "--protocol-decoder-jsontrace",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Couldn't run sigrok-cli: {e}"))?;
+    let mut stdin = child.stdin.take().unwrap();
+    let out = std::thread::scope(|sc| {
+        sc.spawn(move || stdin.write_all(samples)); // write while reading: neither pipe may fill up
+        child.wait_with_output()
+    })
+    .map_err(|e| e.to_string())?;
+    let err = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() {
+        return Err(err.trim().to_string());
+    }
+    let anns = parse_trace(&String::from_utf8_lossy(&out.stdout), rate as f64)?;
+    match err.lines().find(|l| l.contains("Required channel")) {
+        Some(l) if anns.is_empty() => Err(l.trim_start_matches("srd: ").to_string()),
+        _ => Ok(anns),
+    }
+}
+
+#[tauri::command]
+async fn sigrok_decode(
+    samples: Vec<u8>,
+    channels: u8,
+    rate: u64,
+    stack: Vec<PdSpec>,
+) -> Result<Vec<Ann>, String> {
+    tauri::async_runtime::spawn_blocking(move || sigrok_run(&samples, channels, rate, &stack))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(Link::default())
         .manage(Live::default())
         .invoke_handler(tauri::generate_handler![
-            list_ports, capture, autoset, live_start, live_stop, write_text, read_text
+            list_ports,
+            capture,
+            autoset,
+            live_start,
+            live_stop,
+            sigrok_decoders,
+            sigrok_decode,
+            write_text,
+            read_text
         ])
         .run(tauri::generate_context!())
         .expect("error while running Mojo LA");
@@ -505,6 +829,161 @@ mod tests {
             channels: 8,
             rle: false,
         }
+    }
+
+    const UART_SHOW: &str = "ID: uart
+Name: UART
+Long name: Universal Asynchronous Receiver/Transmitter
+Description: Asynchronous, serial bus.
+Possible decoder input IDs:
+- logic
+Possible decoder output IDs:
+- uart
+Annotation rows:
+- rx-data-bits (RX bits): rx-data-bits
+- rx-data (RX): rx-data, rx-start, rx-stop
+Required channels:
+None.
+Optional channels:
+- rx (RX): UART receive line
+Options:
+- baudrate: Baud rate (default 115200)
+- parity: Parity ('none', 'odd', default 'none')
+- rx_packet_delim: RX packet delimiter (decimal) (default -1)
+";
+
+    #[test]
+    fn decoder_details() {
+        let d = parse_show(UART_SHOW);
+        assert_eq!((d.id.as_str(), d.name.as_str()), ("uart", "UART"));
+        assert_eq!(
+            (d.inputs, d.outputs),
+            (vec!["logic".to_string()], vec!["uart".to_string()])
+        );
+        assert_eq!(d.rows, ["RX bits", "RX"]);
+        assert!(d.required.is_empty());
+        assert_eq!(
+            d.optional,
+            [PdChannel {
+                id: "rx".into(),
+                name: "RX".into(),
+                desc: "UART receive line".into()
+            }]
+        );
+        let o = |id: &str, desc: &str, default: &str, values: &[&str]| PdOption {
+            id: id.into(),
+            desc: desc.into(),
+            default: default.into(),
+            values: values.iter().map(|v| v.to_string()).collect(),
+        };
+        assert_eq!(
+            d.options,
+            [
+                o("baudrate", "Baud rate", "115200", &[]),
+                o("parity", "Parity", "none", &["none", "odd"]),
+                o(
+                    "rx_packet_delim",
+                    "RX packet delimiter (decimal)",
+                    "-1",
+                    &[]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn decoder_without_rows() {
+        let d = parse_show("ID: lm75\nAnnotation classes:\n- celsius: Temperature in degrees Celsius\n- warnings: Human-readable warnings\nAnnotation rows:\nNone.\n");
+        assert_eq!(d.rows, ["celsius", "warnings"]);
+    }
+
+    #[test]
+    fn decoder_stack_argument() {
+        let pd = |id: &str, ch: &[(&str, u8)], opts: &[(&str, &str)]| PdSpec {
+            id: id.into(),
+            channels: ch.iter().map(|&(k, v)| (k.into(), v)).collect(),
+            options: opts.iter().map(|&(k, v)| (k.into(), v.into())).collect(),
+        };
+        let stack = [
+            pd("i2c", &[("scl", 2), ("sda", 3)], &[]),
+            pd("eeprom24xx", &[], &[("chip", "generic")]),
+        ];
+        assert_eq!(
+            pd_arg(&stack).unwrap(),
+            "i2c:scl=2:sda=3,eeprom24xx:chip=generic"
+        );
+        assert!(pd_arg(&[pd("uart", &[], &[("format", "a:b")])]).is_err());
+        assert!(pd_arg(&[pd("uart,i2c", &[], &[])]).is_err());
+        assert!(pd_arg(&[]).is_err());
+    }
+
+    #[test]
+    fn decoder_trace() {
+        let json = r#"{"traceEvents": [
+{"ph": "B", "ts": 50.000000, "pid": "uart-1", "tid": "RX", "name": "Start bit"},
+{"ph": "E", "ts": 59.000000, "pid": "uart-1", "tid": "RX", "name": "Start bit"},
+{"ph": "B", "ts": 59.000000, "pid": "uart-1", "tid": "RX", "name": "48"},
+{"ph": "E", "ts": 129.500000, "pid": "uart-1", "tid": "RX", "name": "48"}
+]}"#;
+        let a = parse_trace(json, 2e6).unwrap();
+        let ann = |start, end, text: &str| Ann {
+            pd: "uart-1".into(),
+            row: "RX".into(),
+            start,
+            end,
+            text: text.into(),
+        };
+        assert_eq!(a, [ann(100, 118, "Start bit"), ann(118, 259, "48")]);
+        assert!(parse_trace("", 1e6).unwrap().is_empty());
+        assert!(parse_trace("{oops", 1e6).is_err());
+    }
+
+    /// Writes the installed decoder catalog as JSON, for trying the UI in a browser:
+    /// MOJO_CATALOG=path cargo test dump_catalog -- --ignored
+    #[test]
+    #[ignore]
+    fn dump_catalog() {
+        let c = tauri::async_runtime::block_on(sigrok_decoders()).unwrap();
+        println!("{} decoders", c.len());
+        std::fs::write(
+            std::env::var("MOJO_CATALOG").unwrap(),
+            serde_json::to_string(&c).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// The real thing, when sigrok-cli is installed: "Hi" at 115200 baud on D1, 1 MHz.
+    #[test]
+    fn sigrok_uart_roundtrip() {
+        if sigrok_cli().is_none() {
+            assert!(
+                std::env::var_os("MOJO_NEED_SIGROK").is_none(),
+                "sigrok-cli not found"
+            );
+            return;
+        }
+        let mut s = vec![0xFFu8; 50];
+        for b in b"Hi" {
+            let start = s.len() as f64;
+            for k in 0..10 {
+                let bit = k == 9 || (k > 0 && (b >> (k - 1)) & 1 == 1);
+                let end = (start + (k + 1) as f64 * 1e6 / 115_200.0).round() as usize;
+                s.resize(end, if bit { 0xFF } else { 0xFD });
+            }
+        }
+        s.resize(s.len() + 50, 0xFF);
+        let stack = [PdSpec {
+            id: "uart".into(),
+            channels: [("rx".to_string(), 1)].into(),
+            options: [("format".to_string(), "ascii".to_string())].into(),
+        }];
+        let a = sigrok_run(&s, 8, 1_000_000, &stack).unwrap();
+        let data: Vec<&str> = a
+            .iter()
+            .filter(|a| a.row == "RX" && a.text.len() == 1)
+            .map(|a| a.text.as_str())
+            .collect();
+        assert_eq!(data, ["H", "i"]);
     }
 
     #[test]

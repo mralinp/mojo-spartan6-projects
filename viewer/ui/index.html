@@ -149,6 +149,28 @@
   #lrows tr.drop td { color: #f2cc4c; }
   #ldetail { margin: 0; overflow: auto; min-height: 0; padding: 8px 12px; border-left: 1px solid var(--line); font: 12px/1.6 var(--mono); color: var(--fg); white-space: pre; }
   #log[aria-pressed="true"] { border-color: var(--accent-hi); color: #fff; }
+  .bus details { color: var(--dim); }
+  .bus details[open] { flex-basis: 100%; }
+  .bus summary { cursor: pointer; }
+  .bus .opts { display: flex; flex-wrap: wrap; gap: 6px 14px; padding: 4px 0 2px 14px; }
+  .bus .opts input { width: 9ch; font: 12px var(--mono); color: var(--fg); background: var(--bg); border: 1px solid var(--line); border-radius: 4px; padding: 2px 4px; }
+  .bus .stacked { font: 12px var(--mono); color: var(--fg); }
+  .bus .stacked button { padding: 0 5px; margin-left: 2px; font-size: 11px; }
+  #pdpick { width: min(640px, 92vw); max-height: 80vh; padding: 0; color: var(--fg); background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+  #pdpick[open] { display: flex; flex-direction: column; }
+  #pdpick::backdrop { background: #0008; }
+  .pdhead { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px 6px; margin: 0; }
+  .pdhead h2 { font-size: 14px; margin: 0; }
+  .pdhead button { padding: 1px 8px; }
+  #pdq { margin: 0 14px 8px; font: 13px var(--ui); color: var(--fg); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 9px; }
+  #pdlist { list-style: none; margin: 0; padding: 0 0 8px; overflow: auto; min-height: 0; }
+  #pdlist button { display: grid; grid-template-columns: 150px 1fr; gap: 0 12px; width: 100%; text-align: left; border: 0; border-radius: 0; background: none; padding: 5px 14px; }
+  #pdlist button:hover, #pdlist button:focus-visible { background: var(--grid); }
+  #pdlist b { font-weight: 600; }
+  #pdlist small { grid-column: 2; color: var(--dim); }
+  #pdmsg { padding: 4px 14px 14px; color: var(--dim); font-size: 12px; line-height: 1.6; }
+  #pdmsg code { font: 12px var(--mono); color: var(--fg); }
+  #pdmsg:empty { display: none; }
   #cv { position: absolute; inset: 0; width: 100%; height: 100%; display: block; cursor: crosshair; }
   #cv.dragging { cursor: grabbing; }
 
@@ -246,12 +268,20 @@
       <span id="warn"></span>
       <button id="add-i2c" title="Decode an I²C bus">+ I²C</button>
       <button id="add-spi" title="Decode an SPI bus">+ SPI</button>
+      <button id="add-pd" title="Decode any protocol sigrok knows: CAN, 1-Wire, WS2812, DHT11, IR remotes, JTAG, SWD… (needs sigrok-cli)">+ Decoder…</button>
       <button id="copy">Copy dump</button>
     </div>
     <div id="buses"></div>
     <div id="frames"></div>
   </div>
 </section>
+
+<dialog id="pdpick" aria-labelledby="pdpick-h">
+  <form method="dialog" class="pdhead"><h2 id="pdpick-h">Add a decoder</h2><button value="cancel" aria-label="Close">×</button></form>
+  <input type="search" id="pdq" placeholder="Search: CAN, 1-Wire, WS2812, DHT11, IR…" aria-label="Search decoders">
+  <ul id="pdlist"></ul>
+  <div id="pdmsg"></div>
+</dialog>
 
 <footer>
   <span>t <b id="r-time">–</b></span>
@@ -269,6 +299,7 @@
 <script src="compare.js"></script>
 <script src="rle.js"></script>
 <script src="livelog.js"></script>
+<script src="sigrok.js"></script>
 <script>
 // Probe-lead colours, as on Saleae/sigrok harnesses: black, brown, red, orange, yellow, green, blue, violet.
 const COLORS = ['#a3a9b2', '#c08a5c', '#ef4f57', '#f2913f', '#f2cc4c', '#4cb764', '#4c96f7', '#a77ce6',
@@ -310,7 +341,7 @@ const BUSES_KEY = 'mojo-la.buses';
 const buses = (() => { try { const b = JSON.parse(localStorage.getItem(BUSES_KEY)); if (Array.isArray(b)) return b; } catch {} return []; })();
 function saveBuses() { try { localStorage.setItem(BUSES_KEY, JSON.stringify(buses)); } catch {} }
 /** Rows that get a label band under the trace: UART channels and the data lines of each bus. */
-const decodedRow = ch => uartOn[ch] || buses.some(b => b.type === 'i2c' ? b.sda === ch : b.mosi === ch || b.miso === ch);
+const decodedRow = ch => uartOn[ch] || buses.some(b => b.type === 'i2c' ? b.sda === ch : b.type === 'sigrok' ? homeChannel(b) === ch : b.mosi === ch || b.miso === ch);
 
 const fmtHz = f => { const [d, u] = f >= 1e6 ? [1e6, 'MHz'] : f >= 1e3 ? [1e3, 'kHz'] : [1, 'Hz']; return +(f / d).toPrecision(4) + ' ' + u; };
 function fmtTime(s) {
@@ -694,12 +725,14 @@ function setReference(e) {
   renderHistory(); computeCompare(); draw();
   if (ref) { selectTab('compare'); status(`Comparing against ${ref.source} from ${new Date(ref.takenAt).toLocaleTimeString()}`); }
 }
+// a decoded value for innerHTML: bytes as hex, decoder text quoted and escaped
+const shown = v => typeof v === 'number' ? hex(v) : JSON.stringify(String(v)).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
 function computeCompare() {
   cmp = null;
   if (ref && data && ref.samples !== data) {
     const cur = { samples: data, rate, trigIdx }, tol = +$('ctol').value;
     const both = Math.min(chOf(data), chOf(ref.samples));   // only channels both captures have
-    const byCh = list => Array.from({ length: both }, (_, ch) => list.filter(f => f.ch === ch).map(f => f.byte)); // every byte drawn on the row
+    const byCh = list => Array.from({ length: both }, (_, ch) => list.filter(f => f.ch === ch).map(f => f.byte ?? f.long)); // every byte (or decoder text) drawn on the row
     const curBytes = byCh(items), refBytes = byCh(decodeData(ref.samples, ref.rate).items);
     cmp = { a0: anchor(cur), r0: anchor(ref), k: ref.rate / rate, onTrigger: trigIdx !== null && ref.trigIdx !== null,
       ch: Array.from({ length: both }, (_, ch) => ({ ...diffChannel(cur, ref, ch, tol), bytes: diffBytes(curBytes[ch], refBytes[ch]), nBytes: curBytes[ch].length })) };
@@ -722,7 +755,7 @@ function renderCompare() {
     const b = c.bytes;
     const bytes = !c.nBytes && !b.extra ? '<span class="same">–</span>'
       : b.changed.length || b.extra
-        ? `<span class="bad">${b.changed.length} of ${Math.min(c.nBytes, c.nBytes - b.extra)} differ${b.changed.length ? `, first #${b.changed[0].i + 1}: ${hex(b.changed[0].cur)} vs ${hex(b.changed[0].ref)}` : ''}${b.extra ? `; ${Math.abs(b.extra)} ${b.extra > 0 ? 'more' : 'fewer'} than the reference` : ''}</span>`
+        ? `<span class="bad">${b.changed.length} of ${Math.min(c.nBytes, c.nBytes - b.extra)} differ${b.changed.length ? `, first #${b.changed[0].i + 1}: ${shown(b.changed[0].cur)} vs ${shown(b.changed[0].ref)}` : ''}${b.extra ? `; ${Math.abs(b.extra)} ${b.extra > 0 ? 'more' : 'fewer'} than the reference` : ''}</span>`
         : `<span class="same">all ${c.nBytes} match</span>`;
     tr.innerHTML = `<td><span class="sw" style="background:${COLORS[ch]}"></span><span class="n"></span></td><td>${wave}</td><td>${longest}</td><td>${bytes}</td>`;
     tr.querySelector('.n').textContent = label(ch);
@@ -895,6 +928,11 @@ function decodeData(data, rate) {         // shadows the shown capture on purpos
           }
         }
         summaries.push({ ch: b.sda, what: 'I²C', text: parts.join(' ') || '–' });
+      } else if (b.type === 'sigrok') {
+        const r = sigrokResult(data, rate, b), its = r.anns ? annItems(r.anns, b, catalog) : [];
+        items.push(...its);
+        summaries.push({ ch: homeChannel(b), what: b.stack.map(p => pdName(p.id)).join(' → '),
+          text: r.anns ? its.filter(i => !i.bad).map(i => i.long).join(' ') || '–' : r.err || 'decoding…' });
       } else {
         const bytes = decodeSPI(data, b), mo = [], mi = [];
         for (const x of bytes) {
@@ -933,7 +971,7 @@ function renderDump() {
   for (const f of shown) {
     const row = document.createElement('div');
     row.innerHTML = `<span class="t">${fmtTime((f.start - t0()) / rate)}</span><span class="c" style="color:${COLORS[f.ch]}"></span>
-      <span>${hex(f.byte)}</span><span></span><span class="${f.bad ? 'err' : 'note'}"></span>`;
+      <span>${f.byte == null ? '' : hex(f.byte)}</span><span></span><span class="${f.bad ? 'err' : 'note'}"></span>`;
     row.querySelector('.c').textContent = label(f.ch);
     row.children[3].textContent = f.chr;
     row.children[4].textContent = f.note;
@@ -949,7 +987,7 @@ function renderDump() {
 function dumpText() {
   const lines = summaries.map(sm => `${sm.ch >= 0 ? label(sm.ch) + ' ' : ''}${sm.what}: ${sm.text}`);
   lines.push('', 'time\tch\thex\tascii\tnote');
-  for (const f of items.filter(f => f.listed)) lines.push(`${fmtTime((f.start - t0()) / rate)}\t${label(f.ch)}\t${hex(f.byte)}\t${f.chr}\t${f.note}`);
+  for (const f of items.filter(f => f.listed)) lines.push(`${fmtTime((f.start - t0()) / rate)}\t${label(f.ch)}\t${f.byte == null ? '' : hex(f.byte)}\t${f.chr}\t${f.note}`);
   return lines.join('\n');
 }
 $('copy').onclick = async () => {
@@ -983,15 +1021,18 @@ function renderBuses() {
       return sel;
     };
     const title = document.createElement('b');
-    title.textContent = b.type === 'i2c' ? 'I²C' : 'SPI';
+    title.textContent = b.type === 'i2c' ? 'I²C' : b.type === 'sigrok' ? pdName(b.stack[0].id) : 'SPI';
     row.append(title);
-    if (b.type === 'i2c') row.append(pick('scl', 'SCL'), pick('sda', 'SDA'));
+    if (b.type === 'sigrok') { title.title = `Decoded by sigrok (${b.stack.map(p => p.id).join(' → ')})`; pdControls(row, b); }
+    else if (b.type === 'i2c') row.append(pick('scl', 'SCL'), pick('sda', 'SDA'));
     else row.append(pick('sclk', 'SCLK'), pick('mosi', 'MOSI', true), pick('miso', 'MISO', true), pick('cs', 'CS', true),
       choice('mode', [0, 1, 2, 3].map(m => [m, `mode ${m}`])), choice('msbFirst', [[true, 'MSB first'], [false, 'LSB first']]));
     const rm = document.createElement('button');
     rm.className = 'rm'; rm.textContent = '×'; rm.title = `Stop decoding this ${title.textContent} bus`;
     rm.onclick = () => { buses.splice(k, 1); busesChanged(); };
     row.append(rm);
+    const det = row.querySelector('details');
+    if (det) row.append(det);                 // options open below the row, after its × button
     box.append(row);
   });
 }
@@ -1010,6 +1051,119 @@ $('chans').onchange = () => {            // bus pickers offer the channels being
   if ($('rle').disabled) $('rle').checked = false;
 };
 $('add-i2c').onclick = () => { buses.push({ type: 'i2c', scl: 2, sda: 3 }); busesChanged(); };
+// ---- sigrok decoders ----
+let catalog = null, catalogErr = '', catalogLoading = null;
+const pdName = id => catalog?.find(d => d.id === id)?.name ?? id;
+const sigrokRuns = new WeakMap();        // samples -> Map(request -> {anns} | {err} | {pending})
+function loadCatalog(retry = false) {
+  if (!tauri) { catalogErr = 'Decoders from sigrok need the Mojo LA app.'; return Promise.resolve(); }
+  if (catalog || catalogLoading && !retry) return catalogLoading || Promise.resolve();
+  catalogErr = '';
+  return catalogLoading = tauri.core.invoke('sigrok_decoders')
+    .then(c => { catalog = c; }, e => { catalogErr = String(e); })
+    .finally(() => { catalogLoading = null; renderBuses(); decode(); draw(); });
+}
+/** A sigrok bus decoded over samples `d`: runs once per capture and setting, then it's cached. */
+function sigrokResult(d, r, bus) {
+  if (!catalog) { loadCatalog(); return catalogErr ? { err: catalogErr } : { pending: true }; }
+  const spec = specOf(bus, catalog), key = JSON.stringify([r, spec]);
+  let m = sigrokRuns.get(d);
+  if (!m) sigrokRuns.set(d, m = new Map());
+  if (!m.has(key)) {
+    m.set(key, { pending: true });
+    tauri.core.invoke('sigrok_decode', { samples: Array.from(bytesOf(d)), channels: chOf(d), rate: Math.round(r), stack: spec })
+      .then(anns => m.set(key, { anns }), e => m.set(key, { err: String(e) }))
+      .then(() => { if (d === data) { decode(); draw(); } });
+  }
+  return m.get(key);
+}
+/** Controls for a sigrok bus: its lines, decoders stacked on it, options, and which row to show. */
+function pdControls(row, b) {
+  if (!catalog) { row.append(catalogErr || 'loading decoders…'); return; }
+  const first = b.stack[0], d0 = catalog.find(d => d.id === first.id);
+  if (!d0) { row.append(`${first.id} isn't installed.`); return; }
+  for (const [c, optional] of [...d0.required.map(c => [c, false]), ...d0.optional.map(c => [c, true])]) {
+    const l = document.createElement('label'), sel = document.createElement('select');
+    if (optional) sel.add(new Option('—', -1));
+    for (let ch = 0; ch < +$('chans').value; ch++) sel.add(new Option(label(ch), ch));
+    sel.value = first.channels[c.id] ?? -1;
+    sel.onchange = () => { if (+sel.value < 0) delete first.channels[c.id]; else first.channels[c.id] = +sel.value; busesChanged(); };
+    l.title = c.desc; l.append(c.name + ' ', sel);
+    row.append(l);
+  }
+  b.stack.slice(1).forEach((p, k) => {
+    const s = document.createElement('span'), x = document.createElement('button');
+    s.className = 'stacked'; s.textContent = `→ ${pdName(p.id)}`;
+    x.textContent = '×'; x.title = `Stop decoding ${pdName(p.id)}`;
+    x.onclick = () => { b.stack.splice(k + 1); b.show = null; busesChanged(); };
+    s.append(x); row.append(s);
+  });
+  const top = catalog.find(d => d.id === b.stack.at(-1).id), more = stackable(catalog, top);
+  if (more.length) {
+    const sel = document.createElement('select');
+    sel.add(new Option('+ stack…', ''));
+    for (const d of more) sel.add(new Option(d.name, d.id));
+    sel.title = `Decode what ${top.name} finds as another protocol`;
+    sel.onchange = () => { b.stack.push({ id: sel.value, channels: {}, options: {} }); b.show = null; busesChanged(); };
+    row.append(sel);
+  }
+  const rows = b.stack.flatMap(p => (catalog.find(d => d.id === p.id)?.rows || []).map(r => ({ pd: p.id, row: r })));
+  if (rows.length > 1) {
+    const l = document.createElement('label'), sel = document.createElement('select'), cur = shownRow(b, catalog);
+    rows.forEach((r, k) => sel.add(new Option(b.stack.length > 1 ? `${pdName(r.pd)}: ${r.row}` : r.row, k, false, cur && r.pd === cur.pd && r.row === cur.row)));
+    sel.onchange = () => { b.show = rows[+sel.value]; busesChanged(); };
+    l.append('show ', sel); row.append(l);
+  }
+  const opts = b.stack.flatMap(p => (catalog.find(d => d.id === p.id)?.options || []).map(o => [p, o]));
+  if (opts.length) {
+    const det = document.createElement('details'), box = document.createElement('div');
+    det.innerHTML = '<summary>Options</summary>'; box.className = 'opts';
+    det.open = !!b.optsOpen; det.ontoggle = () => { b.optsOpen = det.open; };
+    for (const [p, o] of opts) {
+      const l = document.createElement('label'), cur = p.options[o.id] ?? o.default;
+      let ctl;
+      if (o.values.length) { ctl = document.createElement('select'); for (const v of o.values) ctl.add(new Option(v, v, false, v === String(cur))); }
+      else { ctl = document.createElement('input'); ctl.value = cur; ctl.placeholder = o.default; }
+      ctl.onchange = () => {
+        const v = ctl.value.trim();
+        if (/[:,=]/.test(v)) { status(`${o.desc} can't contain : , or =`, true); ctl.value = cur; return; }
+        p.options[o.id] = v || o.default; busesChanged();
+      };
+      l.title = o.desc; l.append((b.stack.length > 1 ? pdName(p.id) + ' ' : '') + o.desc + ' ', ctl);
+      box.append(l);
+    }
+    det.append(box); row.append(det);
+  }
+}
+function listDecoders() {
+  const q = $('pdq').value.trim().toLowerCase(), list = $('pdlist');
+  list.replaceChildren();
+  if (!catalog) {
+    $('pdmsg').innerHTML = catalogLoading ? 'Looking for sigrok decoders…' : `${tauri ? '' : 'Decoders from sigrok need the Mojo LA app. '}Mojo LA runs the protocol decoders of
+      <b>sigrok</b>, the open-source logic analyzer project: over 100 of them. Install <code>sigrok-cli</code>, then check again.<br>
+      macOS: <code>brew install sigrok-cli</code><br>Debian / Ubuntu: <code>sudo apt install sigrok-cli</code><br>
+      Windows: the sigrok-cli installer from sigrok.org<br>${tauri ? '<button id="pdretry">Check again</button>' : ''}`;
+    $('pdretry')?.addEventListener('click', () => { loadCatalog(true).then(listDecoders); listDecoders(); });
+    return;
+  }
+  $('pdmsg').textContent = '';
+  const found = firstDecoders(catalog).filter(d => !q || `${d.id} ${d.name} ${d.longname} ${d.desc}`.toLowerCase().includes(q));
+  for (const d of found) {
+    const li = document.createElement('li'), btn = document.createElement('button');
+    btn.innerHTML = '<b></b><span></span><small></small>';
+    btn.children[0].textContent = d.name; btn.children[1].textContent = d.longname; btn.children[2].textContent = d.desc;
+    btn.onclick = () => {
+      buses.push(newBus(d, +$('chans').value));
+      $('pdpick').close(); busesChanged(); $('panel').hidden = false; selectTab('dump');
+    };
+    li.append(btn); list.append(li);
+  }
+  if (!found.length) $('pdmsg').textContent = `No decoder matches "${$('pdq').value}".`;
+}
+$('add-pd').onclick = () => { $('pdq').value = ''; $('pdpick').showModal(); listDecoders(); loadCatalog().then(listDecoders); };
+$('pdq').oninput = listDecoders;
+if (buses.some(b => b.type === 'sigrok')) loadCatalog();
+
 $('add-spi').onclick = () => { buses.push({ type: 'spi', sclk: 4, mosi: 5, miso: 6, cs: 7, mode: 0, msbFirst: true }); busesChanged(); };
 renderBuses();
 
@@ -1157,7 +1311,8 @@ function draw() {
       ctx.fillStyle = f.bad ? '#ff8a8f55' : COLORS[ch] + '33';
       ctx.fillRect(x0, by, bw, bh);
       ctx.fillStyle = f.bad ? '#ff8a8f' : COLORS[ch]; ctx.fillRect(x0, by, 1, bh);
-      const text = bw > 58 ? f.long : bw > 22 ? f.short : '';
+      const fits = t => t && (t.length <= 3 ? bw > 22 : ctx.measureText(t).width < bw - 6);   // decoder texts vary in length
+      const text = fits(f.long) ? f.long : fits(f.short) ? f.short : '';
       if (text) { ctx.fillStyle = C('--fg'); ctx.fillText(text, x0 + bw / 2, by + bh / 2 + 1); }
     }
     for (const mk of marks) {
@@ -1236,6 +1391,7 @@ cv.addEventListener('pointerup', e => {
 });
 cv.addEventListener('pointerleave', () => { hoverX = null; draw(); });
 addEventListener('keydown', e => {
+  if (document.querySelector('dialog[open]')) return;     // keys belong to the dialog
   if ((e.metaKey || e.ctrlKey) && (e.key === 's' || e.key === 'o')) { e.preventDefault(); (e.key === 's' ? saveCapture : openCapture)(); return; }
   if (e.target.tagName === 'SELECT' || e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' && (e.key === 'Enter' || e.key === ' ')) return;
   if (e.key === 'f' || e.key === 'F') fit();
