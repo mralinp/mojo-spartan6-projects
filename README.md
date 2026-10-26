@@ -153,6 +153,13 @@ frame, opened files and the demo. Each one shows a small preview of all 8 channe
 its rate. Click one to view it again (live mode stops so it stays put). **☆ Pin** keeps a capture, even after
 restarting the app; unpinned ones roll off after the newest 30. **Save** writes any of them as a `.mojola`.
 
+**Compare against a reference.** In **History**, press **Compare** on a known-good capture to make it the
+reference. It's drawn dashed over what's on screen, lined up on the trigger (or the first edge), and red bands mark
+where the two disagree for longer than the **tolerance** you pick. The **Compare** tab lists, per channel, how many
+spans differ and the longest, and which decoded bytes changed (`first #8: 31 vs 30`); click a row to jump to it.
+It works live too: with **Run** on, every new frame is checked against the reference. Different sample rates line up
+in time. Tests: `node viewer/ui/compare.test.js`.
+
 `npx @tauri-apps/cli@2 build` in `viewer/src-tauri` makes a `.app` and `.dmg`. Opening `viewer/ui/index.html` in a
 browser shows the viewer with demo data: AT commands on UART, an SSD1306 and a TMP102 on I²C, and a flash ID read
 on SPI.

@@ -39,6 +39,7 @@ jobs:
           node ../ui/measure.test.js
           node ../ui/buses.test.js
           node ../ui/files.test.js
+          node ../ui/compare.test.js
       - name: logic analyzer testbench
         working-directory: logic_analyzer
         run: |
