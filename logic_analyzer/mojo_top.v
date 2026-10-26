@@ -1,7 +1,9 @@
 // 16-channel SUMP-compatible logic analyzer for the Mojo V3 (Spartan-6 XC6SLX9).
 // Host side: PulseView / sigrok-cli, driver "ols" (Openbench Logic Sniffer),
 // over the Mojo's USB serial port (the AVR bridges it to us at 500 kbaud).
-module mojo_top (
+module mojo_top #(
+    parameter AW = 14                           // 16K samples x 16 channels (16 of 32 BRAMs); the testbench shrinks it
+) (
     input        clk,          // 50 MHz crystal; everything runs on the PLL's 200 MHz (sclk)
     input        rst_n,
     input        cclk,
@@ -13,7 +15,6 @@ module mojo_top (
     input        avr_rx_busy,
     input [15:0] probe
 );
-    localparam AW = 14;                         // 16K samples x 16 channels (16 of 32 BRAMs)
     localparam [31:0] DEPTH = 1 << AW;
     // Reported to SUMP hosts: rates up to 100 MHz keep their standard meaning. 200 MHz
     // needs the demux flag, which only Mojo LA sends.
@@ -100,7 +101,7 @@ module mojo_top (
         endcase
     endfunction
 
-    localparam IDLE = 0, ROM = 1, ARMED = 2, POST = 3, LOAD = 4, SEND = 5;
+    localparam IDLE = 0, ROM = 1, ARMED = 2, POST = 3, LOAD = 4, SEND = 5, LOAD0 = 6;
     reg [2:0]  state = IDLE;
     reg [4:0]  rp = 0, rend = 0;
     reg [2:0]  nargs = 0;
@@ -132,7 +133,21 @@ module mojo_top (
         samp <= in;
         trig <= ((in ^ tval) & tmask) == 0;
     end
-    wire we   = tick && (state == ARMED || state == POST);
+    // Long captures (flags bit 14, 8 channels): store an entry only when a run of equal samples ends,
+    // as {samples it lasted - 1, value}; a run longer than 256 samples becomes several entries.
+    // ponytail: the run in progress when the capture ends isn't stored, so a capture ends at its last change
+    reg        rle = 0;
+    reg  [7:0] rl_val = 0, rl_cnt = 0;
+    reg        rl_first = 1;
+    reg        rl_full = 0;                     // rl_cnt == 255, registered a count early for 200 MHz timing
+    wire       capturing = state == ARMED || state == POST;
+    wire       rl_end = !rl_first && (samp[7:0] != rl_val || rl_full);
+    // wstop ends writing exactly at the last post-trigger entry. POST notices a cycle later (it counts
+    // registered writes), and at 200 MHz another write in that cycle would overwrite the oldest entry.
+    reg        wstop = 0, wleft1 = 0;
+    reg [18:0] wleft = 0;                       // post-trigger writes still allowed
+    wire       we   = capturing && tick && (!rle || rl_end) && !wstop;
+    wire [15:0] wdata = rle ? {rl_cnt, rl_val} : samp;
 
     // Hold off the trigger until the buffer has the requested pre-trigger samples,
     // or the start of the capture would be stale data from the previous run.
@@ -142,11 +157,18 @@ module mojo_top (
     reg         pre_ok = 0;
     always @(posedge sclk) pre_need <= (rcount > dcount) ? (rcount - dcount) * 4 : 0;
 
+    // The write lands one cycle late, from registers, so the BRAM write enable comes straight off a flip-flop.
+    // POST counts these registered writes too (wp_r: written while in POST), keeping the run compare
+    // out of the state machine's paths.
+    reg        we_r = 0, wp_r = 0;
+    reg [15:0] wdata_r = 0;
+    reg [AW-1:0] wa_r = 0;
+    always @(posedge sclk) begin we_r <= we; wp_r <= we && state == POST; wdata_r <= wdata; wa_r <= wa; end
     reg [15:0] mem [0:DEPTH-1];
     reg [15:0] q;
     reg        hi_byte = 0;                     // sending a sample's second group
     always @(posedge sclk) begin
-        if (we) mem[wa] <= samp;
+        if (we_r) mem[wa_r] <= wdata_r;
         q <= mem[ra];
     end
 
@@ -156,6 +178,15 @@ module mojo_top (
         if (tick) begin tick_cnt <= reload;       tick <= every;         end
         else      begin tick_cnt <= tick_cnt - 1; tick <= tick_cnt == 1; end
         if (we) wa <= wa + 1;
+        if (we && state == POST) begin
+            wleft  <= wleft - 1;
+            wleft1 <= wleft == 2;
+            if (wleft1) wstop <= 1;             // this was the last one
+        end
+        if (tick && capturing) begin
+            if (rl_first || rl_end) begin rl_val <= samp[7:0]; rl_cnt <= 0; rl_full <= 0; rl_first <= 0; end
+            else begin rl_cnt <= rl_cnt + 1; rl_full <= rl_cnt == 8'hFE; end
+        end
         if (we && state == ARMED && filled != DEPTH) filled <= filled + 1;
         pre_ok <= filled >= pre_need;                   // one cycle behind; cleared on arm below
 
@@ -171,20 +202,23 @@ module mojo_top (
                     if (rp == rend) state <= IDLE;
                 end
                 ARMED: if (tick && trig && pre_ok) begin
+                    wleft  <= (dcount + 1) * 4;
+                    wleft1 <= 0;
                     n     <= (dcount + 1) * 4;  // loads are always >= 4, so n_one goes low
                     n_one <= 0;
                     state <= POST;
                 end
-                POST: if (tick) begin
+                POST: if (wp_r) begin           // counts entries written after the trigger: samples, or runs in RLE mode
                     n     <= n - 1;
                     n_one <= n == 2;
                     if (n_one) begin
-                        ra    <= wa;            // last sample written this cycle
+                        ra    <= wa_r;          // the last counted entry; any later write goes past it
                         n     <= (rcount + 1) * 4;
                         n_one <= 0;
-                        state <= LOAD;
+                        state <= LOAD0;
                     end
                 end
+                LOAD0: state <= LOAD;           // the newest entry's write lands this cycle
                 LOAD: begin                     // wait out BRAM read latency
                     hi_byte <= !groups[0];      // group 0 disabled: start with group 1
                     state   <= SEND;
@@ -207,6 +241,7 @@ module mojo_top (
                 8'h80: div <= arg[23:0];
                 8'h82: begin                    // flags: demux, and channel groups 0/1 disabled
                     demux  <= arg[0];
+                    rle    <= arg[14];
                     groups <= (~arg[3:2] == 2'b00) ? 2'b01 : ~arg[3:2];   // never send nothing
                 end
                 8'h81: {dcount, rcount} <= arg;
@@ -225,7 +260,7 @@ module mojo_top (
                     nargs <= 4;
                 end else case (rx_data)
                     8'h00: state <= IDLE;                                   // reset
-                    8'h01: begin state <= ARMED; tick <= 1; filled <= 0; pre_ok <= 0; end      // run
+                    8'h01: begin state <= ARMED; tick <= 1; filled <= 0; pre_ok <= 0; rl_first <= 1; wstop <= 0; end  // run
                     8'h02: begin state <= ROM; rp <= 0; rend <= 3;  end     // ID
                     8'h04: begin state <= ROM; rp <= 4; rend <= 27; end     // metadata
                     default: ;
