@@ -66,6 +66,7 @@ The builds aren't code-signed. On macOS, right-click the app and choose **Open**
 | Max sample rate | 200 MHz (5 ns), from the Spartan-6 PLL; 100 MHz in PulseView |
 | Memory | 16,384 samples, or 16,384 *changes* in long capture (seconds of a mostly idle bus) |
 | Trigger | pattern match (mask + value), pre/post-trigger split; holds off until the pre-trigger part is fresh |
+| Live UART log | 2 hardware receivers, any channel, 200 baud – 2 Mbaud, 10 µs timestamps, gap-free for as long as you like |
 | Protocol | SUMP / Openbench Logic Sniffer |
 | Link | USB through the Mojo's AVR, 500 kbaud |
 
@@ -113,6 +114,7 @@ It works like an oscilloscope:
 | **Auto** | `A` | Finds the busiest line and the level it rests at, measures its shortest pulse, picks the slowest sample rate with 10 samples per pulse, sets a trigger on that line leaving its rest level with 10% kept before it, and captures. |
 | **Run** / **Stop** | `Space` | Captures again and again and redraws in place, keeping your zoom and marker. With a trigger set it waits for each one (Normal mode); without one it free-runs. |
 | **Capture** | `Enter` | One capture (waits up to 20 s for the trigger). |
+| **Log** / **Stop** | `L` | Streams every byte on the UART channels into the **Live log** tab, with no gaps, until you stop it. |
 
 After every capture the view jumps to where the data begins: the trigger, or the first edge, through the end of
 that first burst. With UART decoding on, that's the first message. `F` zooms out to the whole capture.
@@ -131,10 +133,23 @@ To set things by hand, pick the sample rate, sample count and how much to keep b
 channel's chip to trigger on it (`X` don't care → `0` → `1`). Scroll to zoom, drag to pan, click to drop a marker
 and read the time and frequency to the cursor.
 
-**Live is repeated captures, not a stream.** Everything goes through the Mojo's AVR at about 17 KB/s, so Run
+**Run is repeated captures, not a stream** (for a stream of UART bytes, use **Log**). Everything goes through the Mojo's AVR at about 17 KB/s, so Run
 refreshes about once a second with 16K samples and about 16 times a second with 1K. The app keeps the serial port
 open while it runs: reopening it on every capture would toggle DTR, and five DTR drops within 250 ms put the Mojo's
 AVR into its loader.
+
+**Live UART log, Wireshark-style.** Captures are snapshots: between two Run frames the line keeps talking and
+those bytes are never seen. **Log** is different: two UART receivers inside the FPGA watch the first two channels
+with a **UART** chip on (at the **UART baud** you picked; on *Auto* it's guessed from the capture on screen, else
+115200), and every byte goes to the app with its time, so nothing is missed for minutes or hours. Only bytes cross
+the USB link, not samples, which is why it can run forever. The **Live log** tab shows one row per message (a line
+ending in a newline, or a burst followed by 2 ms of quiet), like Wireshark's packet list:
+number, time in seconds, which line (by its name, colour-coded), length, text and hex. Click a row for its hex
+dump. Type in the filter to keep matching rows (`tick`, `RX`, `0d 0a`; all words must match). **Follow** keeps
+the newest row in view, unless you scrolled up to read. **Save log** writes text or CSV. Framing errors show in red.
+The link carries about 8,000 bytes a second; if both lines together send faster than that for long enough to fill
+the FPGA's 2,048-byte buffer, a yellow row says how many bytes were dropped instead of losing them silently.
+The record format is in `live_log` in `logic_analyzer/mojo_top.v`. Tests: `node viewer/ui/livelog.test.js`.
 
 **Sniffing a UART:** wire the two lines to D0 and D1 and the grounds together; both channels decode as 8N1 UART
 by default (toggle with each channel's **UART** chip). The baud rate is detected from the pulse widths, or pick it.
