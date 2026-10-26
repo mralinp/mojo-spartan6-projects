@@ -64,7 +64,7 @@ The builds aren't code-signed. On macOS, right-click the app and choose **Open**
 |---|---|
 | Channels | 16 (or 8, for twice-as-fast transfers) |
 | Max sample rate | 200 MHz (5 ns), from the Spartan-6 PLL; 100 MHz in PulseView |
-| Memory | 16,384 samples |
+| Memory | 16,384 samples, or 16,384 *changes* in long capture (seconds of a mostly idle bus) |
 | Trigger | pattern match (mask + value), pre/post-trigger split; holds off until the pre-trigger part is fresh |
 | Protocol | SUMP / Openbench Logic Sniffer |
 | Link | USB through the Mojo's AVR, 500 kbaud |
@@ -99,6 +99,12 @@ cd viewer/src-tauri && cargo run --release
 **Channels: 8 or 16.** 16 shows D0–D15; 8 is the default because the hardware then sends one byte per sample
 instead of two, so captures arrive twice as fast. Decoders, measurements, files, history and compare all follow the
 capture's channel count. Older 8-channel `.mojola` files still open.
+
+**Long capture.** Tick **Long capture** (8 channels) and the analyzer stores only changes: each entry is a value
+and how many samples it lasted (up to 256; longer runs take several entries). A busy line costs entries, idle time
+almost doesn't, so 16K entries of a UART at 1 MHz covers seconds instead of 16 ms. The app expands it back into
+samples; the waveform is drawn edge by edge, so millions of samples stay smooth. It uses a flag bit SUMP leaves
+unused (bit 14), so PulseView is unaffected (its own RLE option isn't supported). Tests: `node viewer/ui/rle.test.js`.
 
 It works like an oscilloscope:
 
