@@ -431,9 +431,8 @@ const capturedOf = (bytes, req) => req.s.rle ? expandRLE(bytes, req.s.mask ? req
   : { samples: req.s.channels > 8 ? Uint16Array.from(bytes) : Uint8Array.from(bytes), trigIdx: req.trigIdx };
 function show(d, r, t, keepView = false) {
   data = d; rate = r; trigIdx = t; takenAt = new Date().toISOString();
-  nch = chOf(d);
-  chRows.forEach((row, ch) => { row.hidden = ch >= nch; });
-  $('gutter').classList.toggle('dense', nch > 8);
+  $('chans').value = chOf(d);               // the selector always says what's on screen
+  setRows(chOf(d));
   if (!keepView) marker = markerB = null;
   edgesAll = []; edgesBy = Array.from({ length: 16 }, () => []);
   for (let i = 1; i < d.length; i++) {
@@ -632,7 +631,8 @@ function renderMeasure(force = false) {
   tbody.innerHTML = '';
   for (let ch = 0; ch < nch; ch++) {
     const m = measure(data, ch, i0, i1), tr = document.createElement('tr');
-    const cells = m.level !== null
+    const cells = ch >= chOf(data) ? ['<td class="flat" colspan="6">not in this capture: capture again</td>']
+      : m.level !== null
       ? [`<td class="flat" colspan="6">flat ${m.level ? 'high' : 'low'}</td>`]
       : [`<td>${m.edges}</td>`,
          `<td>${m.period ? fmtHz(rate / m.period.mean) : '–'}</td>`,
@@ -658,10 +658,11 @@ function computeCompare() {
   cmp = null;
   if (ref && data && ref.samples !== data) {
     const cur = { samples: data, rate, trigIdx }, tol = +$('ctol').value;
-    const byCh = list => Array.from({ length: nch }, (_, ch) => list.filter(f => f.ch === ch).map(f => f.byte)); // every byte drawn on the row
+    const both = Math.min(chOf(data), chOf(ref.samples));   // only channels both captures have
+    const byCh = list => Array.from({ length: both }, (_, ch) => list.filter(f => f.ch === ch).map(f => f.byte)); // every byte drawn on the row
     const curBytes = byCh(items), refBytes = byCh(decodeData(ref.samples, ref.rate).items);
     cmp = { a0: anchor(cur), r0: anchor(ref), k: ref.rate / rate, onTrigger: trigIdx !== null && ref.trigIdx !== null,
-      ch: Array.from({ length: nch }, (_, ch) => ({ ...diffChannel(cur, ref, ch, tol), bytes: diffBytes(curBytes[ch], refBytes[ch]), nBytes: curBytes[ch].length })) };
+      ch: Array.from({ length: both }, (_, ch) => ({ ...diffChannel(cur, ref, ch, tol), bytes: diffBytes(curBytes[ch], refBytes[ch]), nBytes: curBytes[ch].length })) };
   }
   renderCompare();
 }
@@ -674,7 +675,7 @@ function renderCompare() {
   $('cref').querySelector('b').textContent = `${ref.source} from ${new Date(ref.takenAt).toLocaleTimeString()}, ${(ref.samples.length / 1024).toFixed(0)}K at ${fmtHz(ref.rate)}`;
   if (!cmp) return;
   $('cref').append(` · aligned on ${cmp.onTrigger ? 'the trigger' : 'the first edge'}`);
-  for (let ch = 0; ch < nch; ch++) {
+  for (let ch = 0; ch < cmp.ch.length; ch++) {
     const c = cmp.ch[ch], tr = document.createElement('tr');
     const wave = c.spans.length ? `<span class="bad">${c.spans.length} difference${c.spans.length > 1 ? 's' : ''}</span>` : '<span class="same">same</span>';
     const longest = c.spans.length ? fmtTime(c.longest / rate) : '–';
@@ -847,7 +848,15 @@ function renderBuses() {
   });
 }
 // defaults match examples/pro_micro_buses: I²C on D2/D3, SPI on D4–D7
+/** Rows shown: the Channels setting. Channels the capture on screen doesn't have stay empty until the next capture. */
+function setRows(n) {
+  nch = n;
+  chRows.forEach((row, ch) => { row.hidden = ch >= nch; });
+  $('gutter').classList.toggle('dense', nch > 8);
+}
 $('chans').onchange = () => {            // bus pickers offer the channels being captured; long capture is 8-channel
+  setRows(+$('chans').value);
+  if (data) { renderMeasure(true); draw(); }
   renderBuses();
   $('rle').disabled = +$('chans').value > 8;
   if ($('rle').disabled) $('rle').checked = false;
@@ -939,6 +948,13 @@ function draw() {
   const i0 = Math.max(0, Math.floor(iAt(0))), i1 = Math.min(data.length, Math.ceil(iAt(w)) + 1);
   for (let ch = 0; ch < nch; ch++) {
     const y = ruler + ch * rowH, m = 1 << ch;
+    if (ch >= chOf(data)) {
+      if (ch === chOf(data)) {
+        ctx.fillStyle = C('--dim'); ctx.font = '12px ' + C('--ui');
+        ctx.fillText(`D${ch}–D${nch - 1} aren't in this capture: press Capture to record ${nch} channels.`, 12, y + rowH / 2 + 4);
+      }
+      continue;
+    }
     const [hi, lo] = decodedRow(ch) ? [y + rowH * 0.12, y + rowH * 0.5] : [y + rowH * 0.24, y + rowH * 0.76];
     ctx.fillStyle = COLORS[ch] + '1c';
     ctx.beginPath();
@@ -960,7 +976,7 @@ function draw() {
     ctx.strokeStyle = COLORS[ch]; ctx.lineWidth = 1.5; ctx.lineJoin = 'miter'; ctx.stroke();
 
     // the reference, dashed, on the same time axis, and red bands where the two disagree
-    if (cmp) {
+    if (cmp?.ch[ch]) {                    // channels both captures have
       for (const sp of cmp.ch[ch].spans) {
         const x0 = xOf(sp.start), x1 = xOf(sp.end);
         if (x1 < 0 || x0 > w) continue;
