@@ -45,6 +45,10 @@ struct Settings {
     /// 8 or 16. Asking for 8 sends one byte per sample: half the transfer time.
     #[serde(default = "eight")]
     channels: u8,
+    /// Long capture (8 channels): the analyzer stores {run length - 1, value} entries, two bytes each,
+    /// only when the inputs change. `samples` then counts entries.
+    #[serde(default)]
+    rle: bool,
 }
 fn eight() -> u8 {
     8
@@ -62,9 +66,11 @@ fn setup(s: &Settings) -> Vec<u8> {
         SUMP_CLOCK / s.rate - 1
     };
     // Flags: bit 0 demux; bits 2-5 turn channel groups 0-3 off. Groups 2-3 don't exist here.
-    let groups_off: u32 = if s.channels > 8 { 0x30 } else { 0x38 }; // 16: groups 2-3 off; 8: groups 1-3 off
+    let two_bytes = s.channels > 8 || s.rle;
+    let groups_off: u32 = if two_bytes { 0x30 } else { 0x38 }; // groups 2-3 off; for one byte, group 1 too
+    let rle = if s.rle { 0x4000 } else { 0 }; // flags bit 14: run-length entries
     [
-        long(0x82, demux as u32 | groups_off),
+        long(0x82, demux as u32 | groups_off | rle),
         long(0x80, div),
         long(0x81, size),
         long(0xC0, s.mask as u32),
@@ -114,7 +120,7 @@ fn capture_on(p: &mut Port, s: &Settings) -> Result<Option<Vec<u16>>, String> {
     p.write_all(&setup(s)).map_err(io)?;
     p.write_all(&[0x01]).map_err(io)?;
 
-    let width = if s.channels > 8 { 2 } else { 1 }; // bytes per sample, low group first
+    let width = if s.channels > 8 || s.rle { 2 } else { 1 }; // bytes per sample (or RLE entry), low first
     let mut buf = vec![0u8; s.samples as usize * width];
     let mut got = 0;
     let deadline = Instant::now() + Duration::from_millis(s.wait_ms);
@@ -235,6 +241,7 @@ fn autoset_on(p: &mut Port, channels: u8) -> Result<Setup, String> {
         value: 0,
         wait_ms: 2000,
         channels,
+        rle: false,
     };
     let d = capture_on(p, &look)?.ok_or("The analyzer didn't answer.")?;
     let a = activity(&d, channels as usize);
@@ -257,6 +264,7 @@ fn autoset_on(p: &mut Port, channels: u8) -> Result<Setup, String> {
             value: if idle_high { 0 } else { mask },
             wait_ms: 3000,
             channels,
+            rle: false,
         };
         let d =
             capture_on(p, &s)?.ok_or(format!("D{ch} went quiet before it could be measured."))?;
@@ -358,6 +366,7 @@ mod tests {
             value,
             wait_ms: 5000,
             channels: 8,
+            rle: false,
         }
     }
 
@@ -380,6 +389,12 @@ mod tests {
             ..settings(1_000_000, 1024, 1024, 0x8001, 0x8000)
         });
         assert_eq!(&wide[0..5], &[0x82, 0x30, 0, 0, 0]);
+        // long capture: both bytes of each entry, plus flags bit 14
+        let rle = setup(&Settings {
+            rle: true,
+            ..settings(1_000_000, 1024, 1024, 0, 0)
+        });
+        assert_eq!(&rle[0..5], &[0x82, 0x30, 0x40, 0, 0]);
         assert_eq!(
             &wide[15..25],
             &[0xC0, 0x01, 0x80, 0, 0, 0xC1, 0x00, 0x80, 0, 0]
@@ -489,6 +504,31 @@ mod tests {
         );
     }
 
+    /// Long capture on the Pro Micro rig: 16K run-length entries at 1 MHz of a UART that ticks every
+    /// 100 ms cover seconds, and D1 still toggles inside them.
+    #[test]
+    #[ignore]
+    fn board_long_capture() {
+        let s = Settings {
+            rle: true,
+            ..settings(1_000_000, 16384, 16384, 0, 0)
+        };
+        let e = board()
+            .with(&port(), |p| capture_on(p, &s))
+            .unwrap()
+            .unwrap();
+        assert_eq!(e.len(), 16384);
+        let total: usize = e.iter().map(|&w| (w >> 8) as usize + 1).sum();
+        let d1_changes = e.windows(2).filter(|w| (w[0] ^ w[1]) & 2 != 0).count();
+        println!(
+            "long capture: {} entries cover {:.2} s, D1 changes {d1_changes} times",
+            e.len(),
+            total as f64 / 1e6
+        );
+        assert!(total >= 2_000_000, "only {total} samples");
+        assert!(d1_changes > 100);
+    }
+
     /// 30 back-to-back captures on one connection: the analyzer must still answer afterwards.
     #[test]
     #[ignore]
@@ -530,6 +570,7 @@ mod tests {
         for (rate, want) in [(200_000_000, 1700.0), (100_000_000, 850.0)] {
             let s = Settings {
                 channels: 8,
+                rle: false,
                 rate,
                 samples: 16384,
                 post: 14748,
