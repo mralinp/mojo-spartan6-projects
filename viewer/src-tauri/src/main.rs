@@ -39,9 +39,15 @@ struct Settings {
     rate: u32,
     samples: u32,
     post: u32,
-    mask: u8,
-    value: u8,
+    mask: u16,
+    value: u16,
     wait_ms: u64,
+    /// 8 or 16. Asking for 8 sends one byte per sample: half the transfer time.
+    #[serde(default = "eight")]
+    channels: u8,
+}
+fn eight() -> u8 {
+    8
 }
 
 /// SUMP setup commands for one capture.
@@ -55,8 +61,10 @@ fn setup(s: &Settings) -> Vec<u8> {
     } else {
         SUMP_CLOCK / s.rate - 1
     };
+    // Flags: bit 0 demux; bits 2-5 turn channel groups 0-3 off. Groups 2-3 don't exist here.
+    let groups_off: u32 = if s.channels > 8 { 0x30 } else { 0x38 }; // 16: groups 2-3 off; 8: groups 1-3 off
     [
-        long(0x82, demux as u32),
+        long(0x82, demux as u32 | groups_off),
         long(0x80, div),
         long(0x81, size),
         long(0xC0, s.mask as u32),
@@ -100,13 +108,14 @@ fn connect(name: &str) -> Result<Port, String> {
 }
 
 /// One capture, oldest sample first. `None` when the trigger didn't fire within `wait_ms`.
-fn capture_on(p: &mut Port, s: &Settings) -> Result<Option<Vec<u8>>, String> {
+fn capture_on(p: &mut Port, s: &Settings) -> Result<Option<Vec<u16>>, String> {
     let io = |e: std::io::Error| e.to_string();
     let _ = p.clear(serialport::ClearBuffer::Input);
     p.write_all(&setup(s)).map_err(io)?;
     p.write_all(&[0x01]).map_err(io)?;
 
-    let mut buf = vec![0u8; s.samples as usize];
+    let width = if s.channels > 8 { 2 } else { 1 }; // bytes per sample, low group first
+    let mut buf = vec![0u8; s.samples as usize * width];
     let mut got = 0;
     let deadline = Instant::now() + Duration::from_millis(s.wait_ms);
     while got < buf.len() {
@@ -116,7 +125,8 @@ fn capture_on(p: &mut Port, s: &Settings) -> Result<Option<Vec<u8>>, String> {
                 if Instant::now() > deadline {
                     if got > 0 {
                         return Err(format!(
-                            "Capture stopped after {got} of {} samples.",
+                            "Capture stopped after {} of {} samples.",
+                            got / width,
                             s.samples
                         ));
                     }
@@ -129,8 +139,12 @@ fn capture_on(p: &mut Port, s: &Settings) -> Result<Option<Vec<u8>>, String> {
             Err(e) => return Err(io(e)),
         }
     }
-    buf.reverse(); // SUMP sends newest first
-    Ok(Some(buf))
+    let mut out: Vec<u16> = buf
+        .chunks(width)
+        .map(|c| c[0] as u16 | c.get(1).map_or(0, |&h| (h as u16) << 8))
+        .collect();
+    out.reverse(); // SUMP sends newest first
+    Ok(Some(out))
 }
 
 /// The open connection, kept between captures. Reopening the port toggles DTR,
@@ -168,8 +182,8 @@ struct Activity {
     min_run: Option<usize>,
 }
 
-fn activity(d: &[u8]) -> [Activity; 8] {
-    let mut out = [Activity::default(); 8];
+fn activity(d: &[u16], channels: usize) -> Vec<Activity> {
+    let mut out = vec![Activity::default(); channels];
     for (ch, a) in out.iter_mut().enumerate() {
         let bit = |i: usize| (d[i] >> ch) & 1;
         let highs = (0..d.len()).filter(|&i| bit(i) == 1).count();
@@ -210,7 +224,7 @@ struct Setup {
     pulse_ns: f64,
 }
 
-fn autoset_on(p: &mut Port) -> Result<Setup, String> {
+fn autoset_on(p: &mut Port, channels: u8) -> Result<Setup, String> {
     // 1. Which lines move, and where do they rest? 0.4 s at 10 kHz.
     // ponytail: a lone pulse shorter than 100 µs can slip between these samples; a faster second look would catch it
     let look = Settings {
@@ -220,17 +234,18 @@ fn autoset_on(p: &mut Port) -> Result<Setup, String> {
         mask: 0,
         value: 0,
         wait_ms: 2000,
+        channels,
     };
     let d = capture_on(p, &look)?.ok_or("The analyzer didn't answer.")?;
-    let a = activity(&d);
-    let ch = (0..8).max_by_key(|&c| a[c].edges).unwrap();
+    let a = activity(&d, channels as usize);
+    let ch = (0..a.len()).max_by_key(|&c| a[c].edges).unwrap();
     if a[ch].edges == 0 {
         return Err(
             "No activity on any probe for 0.4 s. Check the wiring and the shared ground.".into(),
         );
     }
     let idle_high = a[ch].idle_high;
-    let mask = 1u8 << ch;
+    let mask = 1u16 << ch;
 
     // 2. Shortest pulse: trigger on that line leaving idle, fastest rate first, until a whole pulse fits.
     for rate in [200_000_000, 20_000_000, 2_000_000, 200_000, 20_000] {
@@ -241,10 +256,15 @@ fn autoset_on(p: &mut Port) -> Result<Setup, String> {
             mask,
             value: if idle_high { 0 } else { mask },
             wait_ms: 3000,
+            channels,
         };
         let d =
             capture_on(p, &s)?.ok_or(format!("D{ch} went quiet before it could be measured."))?;
-        if let Some(run) = activity(&d).iter().filter_map(|a| a.min_run).min() {
+        if let Some(run) = activity(&d, channels as usize)
+            .iter()
+            .filter_map(|a| a.min_run)
+            .min()
+        {
             let pulse = run as f64 / rate as f64;
             return Ok(Setup {
                 rate: pick_rate(pulse),
@@ -262,7 +282,7 @@ async fn capture(
     link: tauri::State<'_, Link>,
     port: String,
     s: Settings,
-) -> Result<Option<Vec<u8>>, String> {
+) -> Result<Option<Vec<u16>>, String> {
     let link = link.inner().clone();
     tauri::async_runtime::spawn_blocking(move || link.with(&port, |p| capture_on(p, &s)))
         .await
@@ -270,9 +290,14 @@ async fn capture(
 }
 
 #[tauri::command]
-async fn autoset(link: tauri::State<'_, Link>, port: String) -> Result<Setup, String> {
+async fn autoset(
+    link: tauri::State<'_, Link>,
+    port: String,
+    channels: Option<u8>,
+) -> Result<Setup, String> {
     let link = link.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || link.with(&port, autoset_on))
+    let channels = channels.unwrap_or(8);
+    tauri::async_runtime::spawn_blocking(move || link.with(&port, |p| autoset_on(p, channels)))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -324,7 +349,7 @@ fn main() {
 mod tests {
     use super::*;
 
-    fn settings(rate: u32, samples: u32, post: u32, mask: u8, value: u8) -> Settings {
+    fn settings(rate: u32, samples: u32, post: u32, mask: u16, value: u16) -> Settings {
         Settings {
             rate,
             samples,
@@ -332,6 +357,7 @@ mod tests {
             mask,
             value,
             wait_ms: 5000,
+            channels: 8,
         }
     }
 
@@ -339,15 +365,25 @@ mod tests {
     fn setup_bytes() {
         // 1 MHz, 16K samples, 4K after the trigger, trigger on D0 high
         let b = setup(&settings(1_000_000, 16384, 4096, 0x01, 0x01));
-        assert_eq!(&b[0..5], &[0x82, 0, 0, 0, 0]); // demux off
+        assert_eq!(&b[0..5], &[0x82, 0x38, 0, 0, 0]); // demux off, groups 1-3 off: 8 channels
         assert_eq!(&b[5..10], &[0x80, 99, 0, 0, 0]);
         assert_eq!(&b[10..15], &[0x81, 0xFF, 0x0F, 0xFF, 0x03]);
         assert_eq!(&b[15..25], &[0xC0, 1, 0, 0, 0, 0xC1, 1, 0, 0, 0]);
         // 200 MHz: demux on, divider 0 counts the 200 MHz clock; 100 MHz: plain SUMP, divider 0
         let fast = setup(&settings(200_000_000, 1024, 1024, 0, 0));
-        assert_eq!(&fast[0..10], &[0x82, 1, 0, 0, 0, 0x80, 0, 0, 0, 0]);
+        assert_eq!(&fast[0..10], &[0x82, 0x39, 0, 0, 0, 0x80, 0, 0, 0, 0]);
         let hundred = setup(&settings(100_000_000, 1024, 1024, 0, 0));
-        assert_eq!(&hundred[0..10], &[0x82, 0, 0, 0, 0, 0x80, 0, 0, 0, 0]);
+        assert_eq!(&hundred[0..10], &[0x82, 0x38, 0, 0, 0, 0x80, 0, 0, 0, 0]);
+        // 16 channels: only groups 2-3 off, and a 16-bit trigger mask
+        let wide = setup(&Settings {
+            channels: 16,
+            ..settings(1_000_000, 1024, 1024, 0x8001, 0x8000)
+        });
+        assert_eq!(&wide[0..5], &[0x82, 0x30, 0, 0, 0]);
+        assert_eq!(
+            &wide[15..25],
+            &[0xC0, 0x01, 0x80, 0, 0, 0xC1, 0x00, 0x80, 0, 0]
+        );
         // post is clamped to the 4..=samples range the hardware counts in
         assert_eq!(
             &setup(&settings(50_000_000, 1024, 0, 0, 0))[10..15],
@@ -370,8 +406,11 @@ mod tests {
     #[test]
     fn activity_summary() {
         // D0: idle high with a 3-sample low pulse and a 5-sample low pulse; D1: flat low
-        let d: Vec<u8> = "1111000111110000011111".bytes().map(|c| c - b'0').collect();
-        let a = activity(&d);
+        let d: Vec<u16> = "1111000111110000011111"
+            .bytes()
+            .map(|c| (c - b'0') as u16 | 0x8000)
+            .collect();
+        let a = activity(&d, 16);
         assert_eq!(
             a[0],
             Activity {
@@ -389,7 +428,16 @@ mod tests {
             }
         );
         // a run cut off by the capture's end isn't a pulse
-        assert_eq!(activity(&[1, 1, 0, 0])[0].min_run, None);
+        assert_eq!(activity(&[1, 1, 0, 0], 8)[0].min_run, None);
+        // D15 held high the whole time: idle high, no edges
+        assert_eq!(
+            a[15],
+            Activity {
+                edges: 0,
+                idle_high: true,
+                min_run: None
+            }
+        );
     }
 
     #[test]
@@ -419,6 +467,28 @@ mod tests {
         assert_eq!(d.unwrap().unwrap().len(), 16384);
     }
 
+    /// 16 channels: two bytes per sample come back as one 16-bit sample each. With the Pro Micro rig,
+    /// D1 carries the UART and D8-D15 (nothing wired, pulled down) stay low.
+    #[test]
+    #[ignore]
+    fn board_capture_16() {
+        let s = Settings {
+            channels: 16,
+            ..settings(1_000_000, 16384, 14748, 2, 0)
+        };
+        let d = board()
+            .with(&port(), |p| capture_on(p, &s))
+            .unwrap()
+            .expect("no UART traffic on D1");
+        assert_eq!(d.len(), 16384);
+        let a = activity(&d, 16);
+        assert!(a[1].edges > 0, "D1 should toggle");
+        assert!(
+            a[8..].iter().all(|c| c.edges == 0 && !c.idle_high),
+            "D8-D15 should sit low"
+        );
+    }
+
     /// 30 back-to-back captures on one connection: the analyzer must still answer afterwards.
     #[test]
     #[ignore]
@@ -440,7 +510,7 @@ mod tests {
     #[test]
     #[ignore]
     fn board_autoset() {
-        let s = board().with(&port(), autoset_on).unwrap();
+        let s = board().with(&port(), |p| autoset_on(p, 8)).unwrap();
         println!("{s:?}");
         assert_eq!(s.rate, 2_000_000);
         assert!(s.idle_high);
@@ -459,6 +529,7 @@ mod tests {
         let link = board();
         for (rate, want) in [(200_000_000, 1700.0), (100_000_000, 850.0)] {
             let s = Settings {
+                channels: 8,
                 rate,
                 samples: 16384,
                 post: 14748,
@@ -470,7 +541,7 @@ mod tests {
                 .with(&port(), |p| capture_on(p, &s))
                 .unwrap()
                 .expect("no UART traffic on D1");
-            let run = activity(&d)[1].min_run.expect("no whole bit on D1") as f64;
+            let run = activity(&d, 8)[1].min_run.expect("no whole bit on D1") as f64;
             println!(
                 "{} MHz: shortest pulse on D1 = {run} samples (want ~{want})",
                 rate / 1_000_000
