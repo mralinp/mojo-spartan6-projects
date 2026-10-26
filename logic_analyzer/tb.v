@@ -2,10 +2,10 @@
 `timescale 1ns/1ps
 module tb;
     reg clk = 0, host_tx = 1, avr_busy = 0;   // AVR toggles busy per byte received
-    reg [7:0] probe = 0;
+    reg [15:0] probe = 16'hFF00;
     wire fpga_tx;
     always #10 clk = ~clk;                       // 50 MHz crystal (the PLL stub below makes 200 MHz)
-    always @(posedge clk) probe <= probe + 1;    // counter on the probes, stepping at 50 MHz
+    always @(posedge clk) probe <= {~(probe[7:0] + 8'd1), probe[7:0] + 8'd1};  // counter low, its inverse high, at 50 MHz
 
     mojo_top dut (.clk(clk), .rst_n(1'b1), .cclk(1'b1), .avr_tx(host_tx), .avr_rx(fpga_tx),
                   .avr_rx_busy(avr_busy), .probe(probe));
@@ -25,7 +25,7 @@ module tb;
         avr_busy = ~avr_busy;
     end endtask
 
-    reg [7:0] b, prev;
+    reg [7:0] b, prev, last;
     integer i, repeats;
     initial begin
         #200_000;                                // let cclk detector settle
@@ -37,6 +37,7 @@ module tb;
             recv(b); if (b != "S") $fatal(1, "ID[3]=%h", b);
         end join
 
+        send_long(8'h82, 32'h8);                 // 8 channels: group 1 off
         send_long(8'h80, 1);                     // div 1 -> 50 MHz
         send_long(8'h81, {16'd1, 16'd3});        // 8 after trigger, read 16
         send_long(8'hC0, 8'hFF);                 // trigger on probe == 0x80
@@ -61,7 +62,7 @@ module tb;
             end
         end join
         // 200 MHz (demux flag, div 0): every 50 MHz counter value shows up 4 samples in a row.
-        send_long(8'h82, 1);
+        send_long(8'h82, 32'h9);                 // demux on, group 1 off
         send_long(8'h80, 0);
         send_long(8'h81, {16'd3, 16'd3});
         repeats = 0;
@@ -76,6 +77,18 @@ module tb;
         end join
         // 15 neighbours at 4 samples per value: 11-12 repeats (100 MHz would give 7-8)
         if (repeats < 11) $fatal(1, "only %0d repeats: not sampling at 200 MHz", repeats);
+        // 16 channels at 50 MHz: two bytes per sample, low group first; the high byte is the low one inverted
+        send_long(8'h82, 0);
+        send_long(8'h80, 1);
+        send_long(8'h81, {16'd0, 16'd0});        // 4 samples
+        fork send(8'h01); begin
+            for (i = 0; i < 4; i = i + 1) begin
+                recv(b); recv(prev);
+                if (prev != ~b) $fatal(1, "16-ch sample %0d: high %h is not ~low %h", i, prev, b);
+                if (i > 0 && b != last - 8'd1) $fatal(1, "16-ch sample %0d low %h after %h", i, b, last);
+                last = b;
+            end
+        end join
         $display("PASS");
         $finish;
     end
