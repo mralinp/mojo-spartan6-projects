@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -285,6 +286,141 @@ fn autoset_on(p: &mut Port, channels: u8) -> Result<Setup, String> {
     Err(format!("D{ch} toggles too rarely to measure a pulse."))
 }
 
+/// One live-log receiver: a UART on channel `ch`.
+#[derive(serde::Deserialize, Clone, Copy, Debug)]
+struct LiveRx {
+    ch: u8,
+    baud: u32,
+}
+
+/// What the live log streams: a byte from receiver `rx`, or `dropped` bytes the analyzer couldn't keep.
+#[derive(serde::Serialize, Clone, Copy, Debug, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+struct LiveRec {
+    t_us: u64,
+    rx: u8,
+    byte: u8,
+    err: bool,
+    dropped: u8,
+}
+
+/// Turns the analyzer's 2-byte live records back into timestamped bytes (see live_log in mojo_top.v).
+#[derive(Default)]
+struct LiveParser {
+    t: u64, // 10 us steps since the start
+    hi: Option<u8>,
+}
+
+impl LiveParser {
+    fn feed(&mut self, bytes: &[u8], out: &mut Vec<LiveRec>) {
+        for &b in bytes {
+            let Some(h) = self.hi.take() else {
+                self.hi = Some(b);
+                continue;
+            };
+            if h == 0x7F {
+                out.push(LiveRec {
+                    t_us: self.t * 10,
+                    dropped: b,
+                    ..Default::default()
+                });
+            } else if h & 0x80 == 0 {
+                self.t += ((h as u64) << 8) | b as u64;
+            } else {
+                self.t += (h & 0x1F) as u64;
+                out.push(LiveRec {
+                    t_us: self.t * 10,
+                    rx: (h >> 6) & 1,
+                    byte: b,
+                    err: h & 0x20 != 0,
+                    dropped: 0,
+                });
+            }
+        }
+    }
+}
+
+/// Streams the live log until `stop`, handing records to `sink` about every 50 ms.
+fn live_on(
+    p: &mut Port,
+    rxs: &[LiveRx],
+    stop: &AtomicBool,
+    mut sink: impl FnMut(Vec<LiveRec>),
+) -> Result<(), String> {
+    let io = |e: std::io::Error| e.to_string();
+    let mut cmd = vec![];
+    for (i, cmd_id) in [0x90u8, 0x91].into_iter().enumerate() {
+        let arg = rxs.get(i).map_or(0, |r| {
+            let cpb = (200_000_000 + r.baud / 2) / r.baud.max(1);
+            (cpb.min(0xF_FFFF) << 12) | 0x10 | (r.ch as u32 & 15)
+        });
+        cmd.extend(long(cmd_id, arg));
+    }
+    cmd.push(0x03);
+    let _ = p.clear(serialport::ClearBuffer::Input);
+    p.write_all(&cmd).map_err(io)?;
+
+    let mut parser = LiveParser::default();
+    let (mut recs, mut buf, mut sent) = (vec![], [0u8; 4096], Instant::now());
+    let r = loop {
+        if stop.load(Ordering::Relaxed) {
+            break Ok(());
+        }
+        match p.read(&mut buf) {
+            Ok(n) => parser.feed(&buf[..n], &mut recs),
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => break Err(io(e)),
+        }
+        if !recs.is_empty() && sent.elapsed() > Duration::from_millis(50) {
+            sink(std::mem::take(&mut recs));
+            sent = Instant::now();
+        }
+    };
+    if !recs.is_empty() {
+        sink(recs);
+    }
+    p.write_all(&[0; 5]).map_err(io)?; // leave live mode
+    std::thread::sleep(Duration::from_millis(20));
+    let _ = p.clear(serialport::ClearBuffer::Input);
+    r
+}
+
+/// Set while a live log runs; clearing it stops the stream.
+#[derive(Default)]
+struct Live(Mutex<Option<Arc<AtomicBool>>>);
+
+/// Starts the live log: records arrive as "live" events, the end (or an error) as "live-end".
+#[tauri::command]
+fn live_start(
+    app: tauri::AppHandle,
+    link: tauri::State<'_, Link>,
+    live: tauri::State<'_, Live>,
+    port: String,
+    rxs: Vec<LiveRx>,
+) {
+    use tauri::Emitter;
+    let stop = Arc::new(AtomicBool::new(false));
+    if let Some(old) = live.0.lock().unwrap().replace(stop.clone()) {
+        old.store(true, Ordering::Relaxed);
+    }
+    let link = link.inner().clone();
+    std::thread::spawn(move || {
+        let r = link.with(&port, |p| {
+            live_on(p, &rxs, &stop, |recs| {
+                let _ = app.emit("live", recs);
+            })
+        });
+        let _ = app.emit("live-end", r.err());
+    });
+}
+
+#[tauri::command]
+fn live_stop(live: tauri::State<'_, Live>) {
+    if let Some(stop) = live.0.lock().unwrap().take() {
+        stop.store(true, Ordering::Relaxed);
+    }
+}
+
 #[tauri::command]
 async fn capture(
     link: tauri::State<'_, Link>,
@@ -331,7 +467,7 @@ fn checked_path(path: &str, allowed: &[&str]) -> Result<std::path::PathBuf, Stri
 /// Saves a capture or an export to a path the user picked in the save dialog.
 #[tauri::command]
 fn write_text(path: String, contents: String) -> Result<(), String> {
-    let p = checked_path(&path, &["mojola", "vcd", "csv"])?;
+    let p = checked_path(&path, &["mojola", "vcd", "csv", "txt"])?;
     std::fs::write(&p, contents).map_err(|e| format!("Couldn't save {}: {e}", p.display()))
 }
 
@@ -346,8 +482,9 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(Link::default())
+        .manage(Live::default())
         .invoke_handler(tauri::generate_handler![
-            list_ports, capture, autoset, write_text, read_text
+            list_ports, capture, autoset, live_start, live_stop, write_text, read_text
         ])
         .run(tauri::generate_context!())
         .expect("error while running Mojo LA");
@@ -368,6 +505,32 @@ mod tests {
             channels: 8,
             rle: false,
         }
+    }
+
+    #[test]
+    fn live_records() {
+        let mut p = LiveParser::default();
+        let mut out = vec![];
+        // 'H' 30 us in; then 'i' on receiver 1 with a framing error 20 us later, fed split mid-record;
+        // then 1000 steps of silence, 5 dropped bytes, and 'x'.
+        p.feed(&[0x83, b'H', 0b1110_0010], &mut out);
+        p.feed(&[b'i', 0x03, 0xE8, 0x7F, 5, 0x80, b'x'], &mut out);
+        let r = |t_us, rx, byte, err, dropped| LiveRec {
+            t_us,
+            rx,
+            byte,
+            err,
+            dropped,
+        };
+        assert_eq!(
+            out,
+            [
+                r(30, 0, b'H', false, 0),
+                r(50, 1, b'i', true, 0),
+                r(10050, 0, 0, false, 5),
+                r(10050, 0, b'x', false, 0),
+            ]
+        );
     }
 
     #[test]
@@ -544,6 +707,61 @@ mod tests {
         println!("30 captures of 1K in {:.2} s", t.elapsed().as_secs_f64());
         drop(link); // the port is exclusive: close it before checking with a fresh connection
         assert!(connect(&port()).is_ok());
+    }
+
+    /// Live log of the Pro Micro's 115200-baud ticks on D1 for 3 s: every line arrives, in order,
+    /// about 100 ms apart, nothing dropped.
+    #[test]
+    #[ignore]
+    fn board_live_log() {
+        let stop = AtomicBool::new(false);
+        let (mut recs, t) = (vec![], Instant::now());
+        board()
+            .with(&port(), |p| {
+                live_on(
+                    p,
+                    &[LiveRx {
+                        ch: 1,
+                        baud: 115_200,
+                    }],
+                    &stop,
+                    |r| {
+                        recs.extend(r);
+                        if t.elapsed() > Duration::from_secs(3) {
+                            stop.store(true, Ordering::Relaxed);
+                        }
+                    },
+                )
+            })
+            .unwrap();
+        assert!(recs.iter().all(|r| r.dropped == 0 && !r.err && r.rx == 0));
+        let text: String = recs.iter().map(|r| r.byte as char).collect();
+        let ticks: Vec<u32> = text
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("tick ")?.parse().ok())
+            .collect();
+        println!(
+            "live log: {} bytes, ticks {:?}..{:?}",
+            recs.len(),
+            ticks.first(),
+            ticks.last()
+        );
+        assert!(ticks.len() >= 25, "only {} ticks", ticks.len());
+        assert!(
+            ticks.windows(2).all(|w| w[1] == w[0] + 1),
+            "ticks skipped: {ticks:?}"
+        );
+        let starts: Vec<u64> = recs
+            .windows(2)
+            .filter(|w| w[0].byte == b'\n')
+            .map(|w| w[1].t_us)
+            .collect();
+        assert!(
+            starts
+                .windows(2)
+                .all(|w| (90_000..110_000).contains(&(w[1] - w[0]))),
+            "ticks not 100 ms apart"
+        );
     }
 
     /// With the Pro Micro UART rig wired up: Auto should find the 115200-baud line.

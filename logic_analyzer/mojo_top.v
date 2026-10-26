@@ -2,7 +2,8 @@
 // Host side: PulseView / sigrok-cli, driver "ols" (Openbench Logic Sniffer),
 // over the Mojo's USB serial port (the AVR bridges it to us at 500 kbaud).
 module mojo_top #(
-    parameter AW = 14                           // 16K samples x 16 channels (16 of 32 BRAMs); the testbench shrinks it
+    parameter AW = 14,                          // 16K samples x 16 channels (16 of 32 BRAMs); the testbench shrinks it
+    parameter LW = 11                           // live-log FIFO: 2K records (2 more BRAMs; 8K spread the 200 MHz placement too thin)
 ) (
     input        clk,          // 50 MHz crystal; everything runs on the PLL's 200 MHz (sclk)
     input        rst_n,
@@ -101,7 +102,7 @@ module mojo_top #(
         endcase
     endfunction
 
-    localparam IDLE = 0, ROM = 1, ARMED = 2, POST = 3, LOAD = 4, SEND = 5, LOAD0 = 6;
+    localparam IDLE = 0, ROM = 1, ARMED = 2, POST = 3, LOAD = 4, SEND = 5, LOAD0 = 6, LIVE = 7;
     reg [2:0]  state = IDLE;
     reg [4:0]  rp = 0, rend = 0;
     reg [2:0]  nargs = 0;
@@ -172,9 +173,32 @@ module mojo_top #(
         q <= mem[ra];
     end
 
+    // Live UART logging (commands 0x90/0x91 set up the receivers, 0x03 starts): bytes stream as
+    // 2-byte records from a FIFO instead of being sampled. See live_log below.
+    reg  [3:0]  lch0 = 0, lch1 = 1;
+    reg         len0 = 0, len1 = 0;
+    reg  [19:0] lcpb0 = 1736, lcpb1 = 1736;     // clocks per bit at 200 MHz: 115200 baud; 20 bits reach 191 baud
+    reg         lv_pop = 0, lv_second = 0;
+    wire [15:0] lv_front;
+    wire        lv_avail;
+    live_log #(.LW(LW)) live (.clk(sclk), .run(state == LIVE), .in(in),
+        .ch0(lch0), .ch1(lch1), .en0(len0), .en1(len1), .cpb0(lcpb0), .cpb1(lcpb1),
+        .pop(lv_pop), .front(lv_front), .avail(lv_avail));
+
+    // The next byte to send, picked a cycle ahead: block RAM to the UART in one 5 ns cycle doesn't
+    // route. steady says out_b's inputs held still last cycle (each send is followed by a whole byte
+    // time of tx_busy, so waiting one more cycle first costs nothing).
+    reg  [7:0]  out_b = 0;
+    reg         steady = 0;
+    always @(posedge sclk) begin
+        out_b  <= state == LIVE ? (lv_second ? lv_front[7:0] : lv_front[15:8]) : hi_byte ? q[15:8] : q[7:0];
+        steady <= state == SEND || state == LIVE && lv_avail && !lv_pop;
+    end
+
     always @(posedge sclk) begin
         tx_start <= 0;
         do_long  <= 0;
+        lv_pop   <= 0;
         if (tick) begin tick_cnt <= reload;       tick <= every;         end
         else      begin tick_cnt <= tick_cnt - 1; tick <= tick_cnt == 1; end
         if (we) wa <= wa + 1;
@@ -219,12 +243,18 @@ module mojo_top #(
                     end
                 end
                 LOAD0: state <= LOAD;           // the newest entry's write lands this cycle
+                LIVE: if (tx_ok && lv_avail && !lv_pop && steady) begin   // each record: high byte, then low
+                    tx_data  <= out_b;
+                    tx_start <= 1;
+                    lv_second <= !lv_second;
+                    lv_pop   <= lv_second;
+                end
                 LOAD: begin                     // wait out BRAM read latency
                     hi_byte <= !groups[0];      // group 0 disabled: start with group 1
                     state   <= SEND;
                 end
-                SEND: if (tx_ok) begin          // SUMP sends newest sample first, enabled groups low first
-                    tx_data  <= hi_byte ? q[15:8] : q[7:0];
+                SEND: if (tx_ok && steady) begin   // SUMP sends newest sample first, enabled groups low first
+                    tx_data  <= out_b;
                     tx_start <= 1;
                     if (!hi_byte && groups[1]) hi_byte <= 1;
                     else begin
@@ -247,6 +277,8 @@ module mojo_top #(
                 8'h81: {dcount, rcount} <= arg;
                 8'hC0: tmask <= arg[15:0];
                 8'hC1: tval  <= arg[15:0];
+                8'h90: {lcpb0, len0, lch0} <= {arg[31:12], arg[4], arg[3:0]};   // live receiver 0
+                8'h91: {lcpb1, len1, lch1} <= {arg[31:12], arg[4], arg[3:0]};   // live receiver 1
                 default: ;                      // other flags, other trigger stages: ignored
             endcase
 
@@ -263,6 +295,7 @@ module mojo_top #(
                     8'h01: begin state <= ARMED; tick <= 1; filled <= 0; pre_ok <= 0; rl_first <= 1; wstop <= 0; end  // run
                     8'h02: begin state <= ROM; rp <= 0; rend <= 3;  end     // ID
                     8'h04: begin state <= ROM; rp <= 4; rend <= 27; end     // metadata
+                    8'h03: begin state <= LIVE; lv_second <= 0; end        // live UART log
                     default: ;
                 endcase
             end
@@ -312,4 +345,116 @@ module uart_tx #(parameter CPB = 100) (
             if (cnt != 0) cnt <= cnt - 1;
             else begin cnt <= CPB - 1; sh <= {1'b1, sh[9:1]}; left <= left - 1; end
         end
+endmodule
+
+// Live UART logging. Two receivers turn bytes into 2-byte records in a FIFO the host drains:
+//   data     1 r e t4..t0 | byte    receiver r, framing error e, time since the previous record
+//   time     0 t14..t8    | t7..t0  for gaps too long for a data record (never 0x7F in the high byte)
+//   dropped  0x7F         | count   the FIFO was full: this many bytes were lost
+// Time counts 10 us boundaries crossed, so deltas add up without drift. run low clears everything.
+module live_log #(parameter LW = 11, parameter UNIT = 2000) (   // UNIT: 10 us of 200 MHz
+    input clk, run,
+    input [15:0] in,
+    input [3:0] ch0, ch1,
+    input en0, en1,
+    input [19:0] cpb0, cpb1,
+    input pop,                  // the host took the front record
+    output [15:0] front,
+    output reg avail = 0
+);
+    reg l0 = 1, l1 = 1;
+    always @(posedge clk) begin l0 <= in[ch0] | !en0; l1 <= in[ch1] | !en1; end
+    wire v0, v1, e0, e1;
+    wire [7:0] d0, d1;
+    uart_sniff rx0 (clk, run & en0, l0, cpb0, v0, d0, e0);
+    uart_sniff rx1 (clk, run & en1, l1, cpb1, v1, d1, e1);
+
+    // FIFO
+    localparam DEPTH = 1 << LW;
+    reg [15:0] fifo [0:DEPTH-1];
+    reg [LW-1:0] wp = 0, rp = 0;
+    reg [LW:0] cnt = 0;
+    reg [15:0] q;
+    reg push = 0;
+    reg [15:0] pdata = 0;
+    reg full = 0;                               // registered for 200 MHz: 2 slots early covers its lag
+    always @(posedge clk) begin
+        if (push) fifo[wp] <= pdata;
+        q <= fifo[rp];
+    end
+    assign front = q;
+
+    // records
+    reg [10:0] unit = 0;
+    reg [14:0] ticks = 0;                       // 10 us steps since the last record
+    reg p0 = 0, p1 = 0, f0 = 0, f1 = 0;         // a received byte waiting to be written
+    reg [7:0] b0 = 0, b1 = 0, dropped = 0;
+    wire both_busy = p0 && p1;
+    always @(posedge clk) begin
+        push  <= 0;
+        avail <= cnt != 0 && !push && !pop && run;
+        full  <= cnt >= DEPTH - 2;   // registered for 200 MHz; q is a cycle behind any push or pop
+        if (!run) begin
+            wp <= 0; rp <= 0; cnt <= 0; unit <= 0; ticks <= 0; p0 <= 0; p1 <= 0; dropped <= 0;
+        end else begin
+            if (unit == UNIT - 1) begin
+                unit <= 0;
+                if (ticks != 15'h7EFF) ticks <= ticks + 1;
+            end else unit <= unit + 1;
+            if (v0) begin if (p0 && dropped != 8'hFF) dropped <= dropped + 1; p0 <= 1; b0 <= d0; f0 <= e0; end
+            if (v1) begin if (p1 && dropped != 8'hFF) dropped <= dropped + 1; p1 <= 1; b1 <= d1; f1 <= e1; end
+
+            if (push) begin wp <= wp + 1; end
+            if (pop)  begin rp <= rp + 1; end
+            cnt <= cnt + push - pop;
+
+            if (!push) begin                    // at most one record per two cycles: plenty, bytes are microseconds apart
+                if (dropped != 0 && !full) begin
+                    push <= 1; pdata <= {8'h7F, dropped}; dropped <= 0;
+                end else if (p0 || p1) begin
+                    if (ticks > 31) begin
+                        if (!full) begin push <= 1; pdata <= {1'b0, ticks}; ticks <= 0; end
+                    end else if (full) begin    // no room: count it, keep going
+                        if (dropped != 8'hFF) dropped <= dropped + 1;
+                        if (p0) p0 <= 0; else p1 <= 0;
+                    end else begin
+                        push  <= 1;
+                        pdata <= p0 ? {1'b1, 1'b0, f0, ticks[4:0], b0} : {1'b1, 1'b1, f1, ticks[4:0], b1};
+                        ticks <= 0;
+                        if (p0) p0 <= 0; else p1 <= 0;
+                    end
+                end else if (ticks == 15'h7EFF && !full) begin   // a long silence: mark the time anyway
+                    push <= 1; pdata <= {1'b0, ticks}; ticks <= 0;
+                end
+            end
+        end
+    end
+endmodule
+
+// 8N1 UART receiver with a run-time bit time (clocks per bit), for live logging. rx is synchronized.
+module uart_sniff (
+    input clk, run, rx,
+    input [19:0] cpb,
+    output reg valid = 0,
+    output reg [7:0] data = 0,
+    output reg ferr = 0
+);
+    reg busy = 0, prev = 1;
+    reg [19:0] cnt = 0;
+    reg [3:0] bitn = 0;
+    always @(posedge clk) begin
+        valid <= 0;
+        prev  <= rx;
+        if (!run) busy <= 0;
+        else if (!busy) begin
+            if (prev && !rx) begin busy <= 1; cnt <= cpb >> 1; bitn <= 0; end   // start bit: wait half a bit
+        end else if (cnt != 0) cnt <= cnt - 1;
+        else begin
+            cnt  <= cpb - 1;
+            bitn <= bitn + 1;
+            if (bitn == 0) begin if (rx) busy <= 0; end                      // glitch, not a start bit
+            else if (bitn <= 8) data <= {rx, data[7:1]};
+            else begin busy <= 0; valid <= 1; ferr <= !rx; end              // stop bit
+        end
+    end
 endmodule

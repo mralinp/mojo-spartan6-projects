@@ -31,10 +31,10 @@
   button.icon { padding: 5px 8px; }
   #capture { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; padding: 8px 18px; margin-left: 4px; }
   #capture:hover { background: var(--accent-hi); }
-  #capture:disabled, #auto:disabled, #run:disabled { opacity: .55; cursor: progress; }
+  #capture:disabled, #auto:disabled, #run:disabled, #log:disabled { opacity: .55; cursor: progress; }
   .actions, .files { display: flex; gap: 6px; align-items: center; }
   .files button, .files select { font-size: 12px; padding: 5px 9px; }
-  #auto, #run { padding: 8px 14px; font-weight: 600; }
+  #auto, #run, #log { padding: 8px 14px; font-weight: 600; }
   #run[aria-pressed="true"] { border-color: var(--accent-hi); color: #fff; }
   #run[aria-pressed="true"]::before { content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 7px; border-radius: 50%; background: var(--accent-hi); vertical-align: 1px; animation: blink 1s steps(2) infinite; }
   @keyframes blink { 50% { opacity: .2; } }
@@ -129,6 +129,26 @@
   #frames .c { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #frames .err { color: #ff8a8f; }
   #frames .empty { cursor: default; color: var(--dim); font-family: var(--ui); display: block; }
+  #panel:has(#live:not([hidden])) { height: max(250px, 45vh); }   /* the log wants room */
+  #live { display: grid; grid-template-rows: auto 1fr; min-height: 0; }
+  .lbar { display: flex; align-items: center; gap: 12px; padding: 6px 14px; border-bottom: 1px solid var(--line); font-size: 12px; color: var(--dim); }
+  .lbar input[type="search"] { flex: 0 1 320px; font: 12px var(--mono); color: var(--fg); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; }
+  .lbar button, .lbar select { font-size: 12px; padding: 3px 10px; }
+  #lstat { margin-left: auto; font: 12px var(--mono); }
+  .lsplit { display: grid; grid-template-columns: 1fr minmax(260px, 34%); min-height: 0; }
+  #lwrap { overflow: auto; min-height: 0; }
+  #live table { border-collapse: collapse; width: 100%; font: 12px/1.6 var(--mono); font-variant-numeric: tabular-nums; table-layout: fixed; }
+  #live th { position: sticky; top: 0; background: var(--panel); font: 600 10px var(--ui); text-transform: uppercase; letter-spacing: .06em; color: var(--dim); text-align: left; padding: 6px 10px 4px; border-bottom: 1px solid var(--line); }
+  #live td { padding: 1px 10px; border-bottom: 1px solid var(--grid); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #live td.n { text-align: right; color: var(--dim); }
+  #live td .sw { display: inline-block; width: 4px; height: 11px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
+  #lrows tr { cursor: pointer; }
+  #lrows tr:hover { background: var(--grid); }
+  #lrows tr[aria-selected="true"] { background: color-mix(in srgb, var(--accent) 22%, transparent); }
+  #lrows tr.bad td { color: #ff8a8f; }
+  #lrows tr.drop td { color: #f2cc4c; }
+  #ldetail { margin: 0; overflow: auto; min-height: 0; padding: 8px 12px; border-left: 1px solid var(--line); font: 12px/1.6 var(--mono); color: var(--fg); white-space: pre; }
+  #log[aria-pressed="true"] { border-color: var(--accent-hi); color: #fff; }
   #cv { position: absolute; inset: 0; width: 100%; height: 100%; display: block; cursor: crosshair; }
   #cv.dragging { cursor: grabbing; }
 
@@ -157,6 +177,7 @@
     <button id="auto" title="Find the active signal and set the sample rate and trigger (A)">Auto</button>
     <button id="run" aria-pressed="false" title="Capture continuously (Space)">Run</button>
     <button id="capture" title="One capture (Enter)">Capture</button>
+    <button id="log" aria-pressed="false" title="Log every byte on the UART channels live, without gaps (L)">Log</button>
   </div>
   <div class="files">
     <button id="open" title="Open a saved capture (⌘O)">Open</button>
@@ -181,6 +202,7 @@
     <button role="tab" id="tab-dump" aria-selected="false" aria-controls="dump">Decoded</button>
     <button role="tab" id="tab-history" aria-selected="false" aria-controls="history">History <span id="hcount"></span></button>
     <button role="tab" id="tab-compare" aria-selected="false" aria-controls="compare">Compare</button>
+    <button role="tab" id="tab-live" aria-selected="false" aria-controls="live">Live log <span id="lcount"></span></button>
     <label class="scope" id="scope-wrap">Over <select id="scope"><option value="all">whole capture</option><option value="view">visible window</option></select></label>
   </div>
   <div id="measure" role="tabpanel" aria-labelledby="tab-measure">
@@ -201,6 +223,23 @@
       <tbody id="crows"></tbody>
     </table>
   </div>
+  <div id="live" role="tabpanel" aria-labelledby="tab-live" hidden>
+    <div class="lbar">
+      <input type="search" id="lfilter" placeholder="Filter: text, hex or line name" aria-label="Filter the log">
+      <label><input type="checkbox" id="lfollow" checked> Follow</label>
+      <span id="lstat">Press Log to record the UART channels.</span>
+      <button id="lclear">Clear</button>
+      <select id="lsave" aria-label="Save the log"><option value="">Save log…</option><option value="txt">Text</option><option value="csv">CSV</option></select>
+    </div>
+    <div class="lsplit">
+      <div id="lwrap"><table>
+        <colgroup><col style="width:64px"><col style="width:104px"><col style="width:96px"><col style="width:48px"><col><col style="width:32%"></colgroup>
+        <thead><tr><th>No.</th><th>Time</th><th>Line</th><th>Len</th><th>Text</th><th>Hex</th></tr></thead>
+        <tbody id="lrows"></tbody>
+      </table></div>
+      <pre id="ldetail">Click a message to see its bytes.</pre>
+    </div>
+  </div>
   <div id="dump" role="tabpanel" aria-labelledby="tab-dump" hidden>
     <div class="bar">
       <div id="streams"></div>
@@ -220,7 +259,7 @@
   <span>value <b id="r-val">–</b></span>
   <span id="r-delta-wrap">Δ <b id="r-delta">click: marker A · shift-click: marker B</b></span>
   <span>view <b id="r-span">–</b></span>
-  <span class="keys"><kbd>scroll</kbd> zoom · <kbd>drag</kbd> pan · <kbd>F</kbd> fit · <kbd>A</kbd> auto · <kbd>Space</kbd> run/stop · <kbd>Enter</kbd> capture · <kbd>Esc</kbd> clear markers</span>
+  <span class="keys"><kbd>scroll</kbd> zoom · <kbd>drag</kbd> pan · <kbd>F</kbd> fit · <kbd>A</kbd> auto · <kbd>Space</kbd> run/stop · <kbd>Enter</kbd> capture · <kbd>L</kbd> log · <kbd>Esc</kbd> clear markers</span>
 </footer>
 
 <script src="uart.js"></script>
@@ -229,6 +268,7 @@
 <script src="files.js"></script>
 <script src="compare.js"></script>
 <script src="rle.js"></script>
+<script src="livelog.js"></script>
 <script>
 // Probe-lead colours, as on Saleae/sigrok harnesses: black, brown, red, orange, yellow, green, blue, violet.
 const COLORS = ['#a3a9b2', '#c08a5c', '#ef4f57', '#f2913f', '#f2cc4c', '#4cb764', '#4c96f7', '#a77ce6',
@@ -329,7 +369,7 @@ for (let ch = 0; ch < 16; ch++) {
 
 function setTrig(ch, v) { trig[ch] = v; trigBtns[ch].dataset.v = trigBtns[ch].textContent = v; }
 function status(msg, err = false) { $('status').textContent = msg; $('status').className = err ? 'err' : ''; }
-function busy(on) { $('capture').disabled = $('auto').disabled = on; $('run').disabled = on && !running; }
+function busy(on) { $('capture').disabled = $('auto').disabled = on; $('run').disabled = on && !running; $('log').disabled = on && !logging; }
 
 async function refreshPorts() {
   if (!tauri) return;
@@ -697,7 +737,7 @@ $('ctol').onchange = () => { computeCompare(); draw(); };
 $('cclear').onclick = () => setReference(null);
 
 function selectTab(which) {
-  for (const [tab, panel] of [['tab-measure', 'measure'], ['tab-dump', 'dump'], ['tab-history', 'history'], ['tab-compare', 'compare']]) {
+  for (const [tab, panel] of [['tab-measure', 'measure'], ['tab-dump', 'dump'], ['tab-history', 'history'], ['tab-compare', 'compare'], ['tab-live', 'live']]) {
     const on = panel === which;
     $(tab).setAttribute('aria-selected', on); $(panel).hidden = !on;
   }
@@ -707,7 +747,115 @@ $('tab-measure').onclick = () => selectTab('measure');
 $('tab-dump').onclick = () => selectTab('dump');
 $('tab-history').onclick = () => selectTab('history');
 $('tab-compare').onclick = () => selectTab('compare');
+$('tab-live').onclick = () => selectTab('live');
 $('scope').onchange = () => renderMeasure(true);
+
+// ---- live log: every UART byte, streamed by the analyzer's own receivers ----
+let logging = false, liveLog = new LiveLog(), liveRx = [], lsel = null, logStart = null;
+const rowOf = new Map();                  // message -> its table row
+const lineName = rx => rx == null ? 'dropped' : label(liveRx[rx]?.ch ?? 0);
+const logFilter = () => $('lfilter').value.trim();
+
+function logCells(m, tr) {
+  const ch = liveRx[m.rx]?.ch;
+  tr.className = m.dropped ? 'drop' : m.errs ? 'bad' : '';
+  tr.innerHTML = `<td class="n">${m.no}</td><td>${(m.tUs / 1e6).toFixed(6)}</td>
+    <td>${m.dropped ? '' : `<span class="sw" style="background:${COLORS[ch]}"></span>`}</td>
+    <td class="n">${m.dropped || m.bytes.length}</td><td></td><td></td>`;
+  tr.cells[2].append(m.dropped ? 'dropped' : lineName(m.rx));
+  tr.cells[4].textContent = m.dropped ? `${m.dropped} bytes lost: the USB link fell behind` : asciiOf(m.bytes) + (m.errs ? `  (${m.errs} framing error${m.errs > 1 ? 's' : ''})` : '');
+  tr.cells[5].textContent = hexOf(m.bytes);
+  tr.setAttribute('aria-selected', m === lsel);
+}
+function logRow(m) {
+  const tr = document.createElement('tr');
+  tr.onclick = () => { const old = rowOf.get(lsel); lsel = m; if (old) old.setAttribute('aria-selected', false); tr.setAttribute('aria-selected', true); logDetail(); };
+  logCells(m, tr); rowOf.set(m, tr);
+  return tr;
+}
+function logDetail() {
+  const m = lsel;
+  if (!m) { $('ldetail').textContent = 'Click a message to see its bytes.'; return; }
+  if (m.dropped) { $('ldetail').textContent = `#${m.no} at ${(m.tUs / 1e6).toFixed(6)} s\n${m.dropped} bytes dropped: they arrived faster than the USB link (about 8,000 bytes/s) could carry them.`; return; }
+  const r = liveRx[m.rx] || {};
+  const lines = [`#${m.no} · ${lineName(m.rx)}${names[r.ch] ? ` (D${r.ch})` : ''} · ${r.baud?.toLocaleString()} baud`,
+    `${(m.tUs / 1e6).toFixed(6)} s · ${m.bytes.length} bytes over ${fmtTime((m.times.at(-1) - m.times[0]) / 1e6)}${m.errs ? ` · ${m.errs} framing errors` : ''}`, ''];
+  for (let i = 0; i < m.bytes.length; i += 8) {
+    const row = m.bytes.slice(i, i + 8);
+    lines.push(`${i.toString(16).padStart(4, '0')}  ${hexOf(row).padEnd(24)} ${asciiOf(row)}`);
+  }
+  $('ldetail').textContent = lines.join('\n');
+}
+function logCount() {
+  const n = liveLog.msgs.reduce((a, m) => a + m.bytes.length, 0);
+  $('lcount').textContent = liveLog.msgs.length ? `(${liveLog.msgs.length})` : '';
+  return n;
+}
+/** New records from the analyzer: grow or add rows, keep following the end. */
+function addRecs(recs) {
+  const wrap = $('lwrap'), atEnd = wrap.scrollTop + wrap.clientHeight >= wrap.scrollHeight - 4, q = logFilter();
+  for (const m of liveLog.push(recs)) {
+    const tr = rowOf.get(m);
+    if (tr) logCells(m, tr);
+    else if (!q || matches(m, q, lineName)) $('lrows').append(logRow(m));
+    if (m === lsel) logDetail();
+  }
+  const n = logCount();
+  $('lstat').textContent = `${n.toLocaleString()} bytes · ${liveLog.msgs.length.toLocaleString()} messages · ${fmtTime((performance.now() - logStart) / 1000)}`;
+  if ($('lfollow').checked && atEnd) wrap.scrollTop = wrap.scrollHeight;
+}
+function renderLog() {
+  rowOf.clear();
+  const q = logFilter();
+  $('lrows').replaceChildren(...liveLog.msgs.filter(m => !q || matches(m, q, lineName)).map(logRow));
+  logDetail(); logCount();
+}
+$('lfilter').oninput = renderLog;
+$('lclear').onclick = () => { liveLog = new LiveLog(); lsel = null; renderLog(); $('lstat').textContent = logging ? 'Logging…' : ''; };
+$('lsave').onchange = async () => {
+  const ext = $('lsave').value; $('lsave').value = '';
+  if (!ext) return;
+  if (!liveLog.msgs.length) return status('The log is empty.', true);
+  const text = ext === 'csv' ? logCSV(liveLog.msgs, lineName)
+    : liveLog.msgs.map(m => `${String(m.no).padStart(6)}  ${(m.tUs / 1e6).toFixed(6).padStart(12)}  ${lineName(m.rx).padEnd(12)}  ${m.dropped ? `[${m.dropped} bytes dropped]` : asciiOf(m.bytes)}`).join('\n') + '\n';
+  try {
+    const at = await saveText(`mojo-la-log-${stamp()}.${ext}`, text, ext, ext === 'csv' ? 'CSV' : 'Text');
+    if (at) status(`Saved the log to ${basename(at)}.`);
+  } catch (e) { status(String(e), true); }
+};
+
+/** Baud for a logged channel: the selector, or a guess from the capture on screen, or 115200. */
+function logBaud(ch) {
+  if (+$('baud').value) return +$('baud').value;
+  return (data && ch < nch && guessBaud(data, ch, rate)) || 115200;
+}
+async function toggleLog() {
+  if (logging) { $('log').disabled = true; return tauri.core.invoke('live_stop'); }   // live-end tidies up
+  if (!tauri) return status('Logging needs the Mojo LA app.', true);
+  const port = $('port').value;
+  if (!port) return status('Plug in the Mojo, then press ↻ to find its port.', true);
+  const chans = uartOn.flatMap((on, ch) => on ? [ch] : []).slice(0, 2);
+  if (!chans.length) return status('Turn on UART for the channel (or two) to log.', true);
+  liveRx = chans.map(ch => ({ ch, baud: logBaud(ch) }));
+  liveLog = new LiveLog(); lsel = null; renderLog();
+  logging = true; logStart = performance.now(); busy(true);
+  $('log').setAttribute('aria-pressed', 'true'); $('log').textContent = 'Stop';
+  $('panel').hidden = false; selectTab('live');
+  $('lstat').textContent = 'Logging…';
+  status(`Logging ${liveRx.map(r => `${label(r.ch)} at ${r.baud.toLocaleString()} baud`).join(' and ')}`);
+  try { await tauri.core.invoke('live_start', { port, rxs: liveRx }); }
+  catch (e) { logEnded(String(e)); }
+}
+function logEnded(err) {
+  logging = false; busy(false);
+  $('log').setAttribute('aria-pressed', 'false'); $('log').textContent = 'Log';
+  if (err) status(err, true);
+  else status(`Log stopped: ${logCount().toLocaleString()} bytes in ${liveLog.msgs.length.toLocaleString()} messages.`);
+}
+if (tauri) {
+  tauri.event.listen('live', e => addRecs(e.payload));
+  tauri.event.listen('live-end', e => logEnded(e.payload));
+}
 
 // ---- decoding ----
 const esc = b => b === 10 ? '\\n' : b === 13 ? '\\r' : b === 9 ? '\\t' : b >= 32 && b < 127 ? String.fromCharCode(b) : '·';
@@ -1094,10 +1242,12 @@ addEventListener('keydown', e => {
   else if (e.key === 'Enter' && !$('capture').disabled) capture();
   else if (e.key === ' ' && !$('run').disabled) { e.preventDefault(); run(); }
   else if ((e.key === 'a' || e.key === 'A') && !$('auto').disabled) auto();
+  else if ((e.key === 'l' || e.key === 'L') && !$('log').disabled) toggleLog();
   else if (e.key === 'Escape') { marker = markerB = null; $('r-delta').textContent = 'click: marker A · shift-click: marker B'; draw(); }
 });
 $('capture').onclick = () => capture();
 $('run').onclick = run;
+$('log').onclick = toggleLog;
 $('auto').onclick = auto;
 $('refresh').onclick = refreshPorts;
 new ResizeObserver(() => { clampView(); draw(); }).observe(cv);

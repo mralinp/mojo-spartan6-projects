@@ -8,9 +8,13 @@ module tb;
     reg freeze = 0;                              // hold the probes still, for RLE saturation
     always @(posedge clk) if (!freeze) probe <= {~(probe[7:0] + 8'd1), probe[7:0] + 8'd1};  // counter low, its inverse high, at 50 MHz
 
-    // 64 samples deep, so a full-ring read is quick to simulate
-    mojo_top #(.AW(6)) dut (.clk(clk), .rst_n(1'b1), .cclk(1'b1), .avr_tx(host_tx), .avr_rx(fpga_tx),
-                  .avr_rx_busy(avr_busy), .probe(probe));
+    // live-log test: two UART lines on probes 2 and 3
+    reg uline = 0, la = 1, lb = 1;
+    wire [15:0] pins = uline ? {probe[15:4], lb, la, probe[1:0]} : probe;
+
+    // 64 samples deep, so a full-ring read is quick to simulate; a 16-record live FIFO to overflow
+    mojo_top #(.AW(6), .LW(4)) dut (.clk(clk), .rst_n(1'b1), .cclk(1'b1), .avr_tx(host_tx), .avr_rx(fpga_tx),
+                  .avr_rx_busy(avr_busy), .probe(pins));
 
     localparam BIT = 2000;                       // 500 kbaud in ns
     task send(input [7:0] b); integer i; begin
@@ -27,8 +31,20 @@ module tb;
         avr_busy = ~avr_busy;
     end endtask
 
+    // 8N1 on a probe line: A at 1 Mbaud, B at 500 kbaud; stop = 0 makes a framing error
+    task uart_a(input [7:0] d, input stop); integer k; begin
+        la = 0; #1000;
+        for (k = 0; k < 8; k = k + 1) begin la = d[k]; #1000; end
+        la = stop; #1000; la = 1;
+    end endtask
+    task uart_b(input [7:0] d); integer k; begin
+        lb = 0; #2000;
+        for (k = 0; k < 8; k = k + 1) begin lb = d[k]; #2000; end
+        lb = 1; #2000;
+    end endtask
+
     reg [7:0] b, prev, last, cnt, val;
-    integer i, repeats;
+    integer i, repeats, got, lost, next;
     initial begin
         #200_000;                                // let cclk detector settle
         send(8'h00);
@@ -139,6 +155,48 @@ module tb;
                 prev = b;
             end
         end join
+        // Live UART log: receiver 0 on probe 2 at 1 Mbaud (cpb 200), receiver 1 on probe 3 at 500 kbaud
+        send(8'h00);
+        uline = 1;
+        send_long(8'h90, {20'd200, 7'd0, 1'b1, 4'd2});
+        send_long(8'h91, {20'd400, 7'd0, 1'b1, 4'd3});
+        send(8'h03);
+        fork begin
+            uart_a("H", 1); uart_a("i", 1);
+            #500_000 uart_b(8'h5A);
+            uart_a("A", 0);
+        end begin
+            recv(b); recv(val);
+            if (b[7:5] != 3'b100 || val != "H") $fatal(1, "live: first record %h %h", b, val);
+            recv(b); recv(val);
+            if (b[7:5] != 3'b100 || b[4:0] > 2 || val != "i") $fatal(1, "live: 'i' record %h %h, want 10 us after 'H'", b, val);
+            recv(b); recv(val);                  // ~500 us of silence: a time record
+            if (b[7] || {b[6:0], val} < 45 || {b[6:0], val} > 55) $fatal(1, "live: time record %h %h", b, val);
+            recv(b); recv(val);
+            if (b[7:5] != 3'b110 || val != 8'h5A) $fatal(1, "live: receiver 1 record %h %h", b, val);
+            recv(b); recv(val);
+            if (b[7:5] != 3'b101 || val != "A") $fatal(1, "live: framing error record %h %h", b, val);
+        end join
+        // 40 bytes back to back outrun the 500 kbaud link and the 16-record FIFO: every byte is either
+        // delivered, in order, or counted in a dropped record.
+        got = 0; lost = 0; next = 0;
+        fork begin
+            for (i = 0; i < 40; i = i + 1) uart_a(i, 1);
+        end begin
+            while (got + lost < 40) begin
+                recv(b); recv(val);
+                if (b == 8'h7F) lost = lost + val;
+                else if (b[7]) begin
+                    if (val < next) $fatal(1, "live: byte %0d after %0d", val, next);
+                    next = val + 1; got = got + 1;
+                end
+            end
+        end join
+        if (lost == 0 || got + lost != 40) $fatal(1, "live overflow: got %0d, lost %0d, last %0d", got, lost, next - 1);
+        // reset leaves live mode
+        send(8'h00);
+        uline = 0;
+        fork send(8'h02); begin recv(b); if (b != "1") $fatal(1, "after live: ID %h", b); recv(b); recv(b); recv(b); end join
         $display("PASS");
         $finish;
     end
