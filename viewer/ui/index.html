@@ -149,6 +149,7 @@
   </label>
   <label class="field">Sample rate <select id="rate"></select></label>
   <label class="field">Channels <select id="chans" title="16 sends two bytes per sample, so captures take twice as long to transfer"><option value="8">8</option><option value="16">16</option></select></label>
+  <label class="field" title="Store only changes: a mostly idle line fits seconds instead of milliseconds. 8 channels.">Long capture <input type="checkbox" id="rle"></label>
   <label class="field">Samples <select id="samples"></select></label>
   <label class="field">Before trigger <select id="pre"></select></label>
   <label class="field">UART baud <select id="baud"></select></label>
@@ -227,6 +228,7 @@
 <script src="buses.js"></script>
 <script src="files.js"></script>
 <script src="compare.js"></script>
+<script src="rle.js"></script>
 <script>
 // Probe-lead colours, as on Saleae/sigrok harnesses: black, brown, red, orange, yellow, green, blue, violet.
 const COLORS = ['#a3a9b2', '#c08a5c', '#ef4f57', '#f2913f', '#f2cc4c', '#4cb764', '#4c96f7', '#a77ce6',
@@ -348,9 +350,12 @@ function request(waitMs) {
   trig.forEach((t, ch) => { if (t !== 'X' && ch < +$('chans').value) { mask |= 1 << ch; if (t === '1') value |= 1 << ch; } });
   // With no trigger, keep every sample after arming so none are stale.
   const post = mask ? Math.max(4, Math.round(samples * (100 - +$('pre').value) / 400) * 4) : samples;
-  return { port, s: { rate: r, samples, post, mask, value, waitMs, channels: +$('chans').value }, trigIdx: mask ? samples - 1 - post : null };
+  const rle = $('rle').checked && +$('chans').value === 8;
+  return { port, s: { rate: r, samples, post, mask, value, waitMs, channels: +$('chans').value, rle }, trigIdx: mask ? samples - 1 - post : null };
 }
-const summary = req => `${req.s.samples.toLocaleString()} samples at ${fmtHz(req.s.rate)} · ${fmtTime(req.s.samples / req.s.rate)}`;
+const summary = req => req.s.rle
+  ? `${req.s.samples.toLocaleString()} changes at ${fmtHz(req.s.rate)} · ${fmtTime(data.length / req.s.rate)} long capture`
+  : `${req.s.samples.toLocaleString()} samples at ${fmtHz(req.s.rate)} · ${fmtTime(req.s.samples / req.s.rate)}`;
 
 async function capture(note = '') {
   const req = request(TRIGGER_WAIT_MS);
@@ -360,7 +365,7 @@ async function capture(note = '') {
   try {
     const bytes = await tauri.core.invoke('capture', { port: req.port, s: req.s });
     if (!bytes) status(`Trigger didn't fire within ${TRIGGER_WAIT_MS / 1000} s.`, true);
-    else { show(samplesOf(bytes, req), req.s.rate, req.trigIdx); remember('capture'); status(note + summary(req)); }
+    else { const c = capturedOf(bytes, req); show(c.samples, req.s.rate, c.trigIdx); remember(req.s.rle ? 'long capture' : 'capture'); status(note + summary(req)); }
   } catch (e) {
     status(String(e), true);
   } finally {
@@ -384,8 +389,9 @@ async function run() {
       if (!running) break;
       if (!bytes) { status('Live · waiting for trigger…'); continue; }
       // keep the user's zoom and marker once there's a frame of the same shape to compare against
-      const keep = !fresh && data?.length === bytes.length && rate === req.s.rate;
-      show(samplesOf(bytes, req), req.s.rate, req.trigIdx, keep);
+      const keep = !fresh && rate === req.s.rate && (req.s.rle || data?.length === bytes.length); // long captures vary in length
+      const c = capturedOf(bytes, req);
+      show(c.samples, req.s.rate, c.trigIdx, keep);
       remember(`live #${++liveFrame}`);
       fresh = false; frames++;
       status(`Live · ${frames} captures · ${(frames * 1000 / (performance.now() - t0)).toFixed(1)}/s · ${summary(req)}`);
@@ -420,7 +426,9 @@ async function auto() {
   await capture(`Auto: ${label(s.channel)} rests ${s.idleHigh ? 'high' : 'low'}, shortest pulse ${fmtTime(s.pulseNs / 1e9)} → `);
 }
 
-const samplesOf = (bytes, req) => req.s.channels > 8 ? Uint16Array.from(bytes) : Uint8Array.from(bytes);
+/** What came back from the analyzer as samples and a trigger position: long captures are expanded. */
+const capturedOf = (bytes, req) => req.s.rle ? expandRLE(bytes, req.s.mask ? req.s.post : 0)
+  : { samples: req.s.channels > 8 ? Uint16Array.from(bytes) : Uint8Array.from(bytes), trigIdx: req.trigIdx };
 function show(d, r, t, keepView = false) {
   data = d; rate = r; trigIdx = t; takenAt = new Date().toISOString();
   nch = chOf(d);
@@ -581,7 +589,7 @@ function renderHistory() {
       <button class="save" title="Save as a .mojola file">Save</button>
       <button class="cmp" aria-pressed="${ref === e}" title="Compare what's on screen against this capture">${ref === e ? 'Reference' : 'Compare'}</button>`;
     if (ref === e) li.classList.add('ref');
-    li.children[0].append(thumb(e));
+    li.children[0].append(e.thumb ??= thumb(e));   // drawn once per capture: long ones are millions of samples
     li.querySelector('.when').textContent = new Date(e.takenAt).toLocaleTimeString();
     li.querySelector('.meta').textContent = `${e.source} · ${(e.samples.length / 1024).toFixed(0)}K at ${fmtHz(e.rate)}` +
       (e.trigIdx !== null ? ' · triggered' : '');
@@ -839,7 +847,11 @@ function renderBuses() {
   });
 }
 // defaults match examples/pro_micro_buses: I²C on D2/D3, SPI on D4–D7
-$('chans').onchange = renderBuses;      // bus pickers offer the channels being captured
+$('chans').onchange = () => {            // bus pickers offer the channels being captured; long capture is 8-channel
+  renderBuses();
+  $('rle').disabled = +$('chans').value > 8;
+  if ($('rle').disabled) $('rle').checked = false;
+};
 $('add-i2c').onclick = () => { buses.push({ type: 'i2c', scl: 2, sda: 3 }); busesChanged(); };
 $('add-spi').onclick = () => { buses.push({ type: 'spi', sclk: 4, mosi: 5, miso: 6, cs: 7, mode: 0, msbFirst: true }); busesChanged(); };
 renderBuses();
@@ -933,14 +945,15 @@ function draw() {
     let prev = data[i0] & m, runStart = i0;
     ctx.moveTo(xOf(i0), prev ? hi : lo);
     const highRun = (a, b) => ctx.fillRect(xOf(a), hi, xOf(b) - xOf(a), lo - hi);
-    for (let i = i0 + 1; i < i1; i++) {
-      const b = data[i] & m;
-      if (b !== prev) {
-        const x = xOf(i);
-        ctx.lineTo(x, prev ? hi : lo); ctx.lineTo(x, b ? hi : lo);
-        if (prev) highRun(runStart, i);
-        prev = b; runStart = i;
-      }
+    // walk this channel's edges, not every sample: long captures are millions of samples
+    const E = edgesBy[ch];
+    let lo_ = 0, hi_ = E.length;
+    while (lo_ < hi_) { const mid = (lo_ + hi_) >> 1; if (E[mid] <= i0) lo_ = mid + 1; else hi_ = mid; }
+    for (let k = lo_; k < E.length && E[k] < i1; k++) {
+      const i = E[k], b = data[i] & m, x = xOf(i);
+      ctx.lineTo(x, prev ? hi : lo); ctx.lineTo(x, b ? hi : lo);
+      if (prev) highRun(runStart, i);
+      prev = b; runStart = i;
     }
     ctx.lineTo(xOf(i1), prev ? hi : lo);
     if (prev) highRun(runStart, i1);
