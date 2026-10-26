@@ -5,9 +5,11 @@ module tb;
     reg [15:0] probe = 16'hFF00;
     wire fpga_tx;
     always #10 clk = ~clk;                       // 50 MHz crystal (the PLL stub below makes 200 MHz)
-    always @(posedge clk) probe <= {~(probe[7:0] + 8'd1), probe[7:0] + 8'd1};  // counter low, its inverse high, at 50 MHz
+    reg freeze = 0;                              // hold the probes still, for RLE saturation
+    always @(posedge clk) if (!freeze) probe <= {~(probe[7:0] + 8'd1), probe[7:0] + 8'd1};  // counter low, its inverse high, at 50 MHz
 
-    mojo_top dut (.clk(clk), .rst_n(1'b1), .cclk(1'b1), .avr_tx(host_tx), .avr_rx(fpga_tx),
+    // 64 samples deep, so a full-ring read is quick to simulate
+    mojo_top #(.AW(6)) dut (.clk(clk), .rst_n(1'b1), .cclk(1'b1), .avr_tx(host_tx), .avr_rx(fpga_tx),
                   .avr_rx_busy(avr_busy), .probe(probe));
 
     localparam BIT = 2000;                       // 500 kbaud in ns
@@ -25,7 +27,7 @@ module tb;
         avr_busy = ~avr_busy;
     end endtask
 
-    reg [7:0] b, prev, last;
+    reg [7:0] b, prev, last, cnt, val;
     integer i, repeats;
     initial begin
         #200_000;                                // let cclk detector settle
@@ -89,10 +91,58 @@ module tb;
                 last = b;
             end
         end join
+        // RLE at 200 MHz: the 50 MHz counter holds each value for 4 samples, so every entry is {3, value},
+        // newest first with consecutive values. 8 entries after the trigger, read the newest 4.
+        send_long(8'h82, 32'h4001);              // RLE, demux, both bytes of each entry
+        send_long(8'h80, 0);
+        send_long(8'h81, {16'd1, 16'd0});
+        send_long(8'hC0, 0);
+        fork send(8'h01); begin
+            for (i = 0; i < 4; i = i + 1) begin
+                recv(val); recv(cnt);
+                if (cnt != 3) $fatal(1, "RLE entry %0d: run %0d, want 3", i, cnt + 1);
+                if (i > 0 && val != last - 8'd1) $fatal(1, "RLE entry %0d value %h after %h", i, val, last);
+                last = val;
+            end
+        end join
+        // RLE with the probes frozen: runs saturate at 256 samples, all the same value
+        freeze = 1;
+        fork send(8'h01); begin
+            recv(last); recv(cnt);
+            if (cnt != 8'hFF) $fatal(1, "RLE saturated run %0d, want 256", cnt + 1);
+            for (i = 1; i < 4; i = i + 1) begin
+                recv(val); recv(cnt);
+                if (cnt != 8'hFF || val != last) $fatal(1, "RLE frozen entry %0d: {%h, %h}", i, cnt, val);
+            end
+        end join
+        freeze = 0;
+        // RLE off again: plain samples come back
+        send_long(8'h82, 0);
+        send_long(8'h80, 1);
+        send_long(8'h81, {16'd0, 16'd0});
+        fork send(8'h01); begin
+            recv(b); recv(prev);
+            if (prev != ~b) $fatal(1, "after RLE: sample isn't plain 16-bit data");
+            for (i = 1; i < 4; i = i + 1) begin recv(b); recv(prev); end
+        end join
+        // Full ring at 200 MHz: read all 64 samples. The oldest must belong to the sequence, not be
+        // overwritten by a write that slips in after the last counted sample.
+        send_long(8'h82, 32'h9);                 // demux, 8 channels
+        send_long(8'h80, 0);
+        send_long(8'h81, {16'd14, 16'd15});      // read 64, 60 after the trigger
+        send_long(8'hC0, 0);
+        fork send(8'h01); begin
+            recv(prev);
+            for (i = 1; i < 64; i = i + 1) begin
+                recv(b);
+                if (b != prev && b != prev - 8'd1) $fatal(1, "full ring: sample %0d = %h after %h", i, b, prev);
+                prev = b;
+            end
+        end join
         $display("PASS");
         $finish;
     end
-    initial begin #20_000_000; $fatal(1, "timeout"); end
+    initial begin #60_000_000; $fatal(1, "timeout"); end
 endmodule
 
 // Simulation stand-ins for the Xilinx clocking primitives: 200 MHz out, locked at once.
