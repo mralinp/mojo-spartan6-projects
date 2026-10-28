@@ -67,6 +67,7 @@ The builds aren't code-signed. On macOS, right-click the app and choose **Open**
 | Memory | 16,384 samples, or 16,384 *changes* in long capture (seconds of a mostly idle bus) |
 | Trigger | pattern match (mask + value), pre/post-trigger split; holds off until the pre-trigger part is fresh |
 | Live UART log | 2 hardware receivers, any channel, 200 baud – 2 Mbaud, 10 µs timestamps, gap-free for as long as you like |
+| Protocol decoders | UART, I²C and SPI built in; over 100 more through sigrok (CAN, 1-Wire, WS2812, DHT11, IR, JTAG, SWD, I²S, SD card, EEPROMs, sensors…) |
 | Protocol | SUMP / Openbench Logic Sniffer |
 | Link | USB through the Mojo's AVR, 500 kbaud |
 
@@ -168,6 +169,27 @@ ACK/NACK; a NACKed address is flagged. SPI reads MOSI and MISO together in mode 
 CS (optional). Bytes are boxed on the SDA / MOSI / MISO rows and listed with UART in time order. One capture records
 all 8 channels at once, so UART, I²C and SPI can be decoded side by side; set the rate for the fastest bus. Buses
 are remembered. Decoder tests: `node viewer/ui/buses.test.js`.
+
+**Every other protocol, through sigrok.** **+ Decoder…** in the **Decoded** tab opens the protocol decoders of
+[sigrok](https://sigrok.org), the open-source logic analyzer project, the same library many commercial analyzers'
+software is built on: CAN, 1-Wire, WS2812 LEDs, DHT11, IR remotes (NEC, RC-5), JTAG, SWD, I²S, SD card, USB low/full
+speed, Modbus, MIDI, and dozens of chips. Search, pick one, and set its lines and options. Decoders that read
+another decoder's output **stack**: I²C → 24xx EEPROM, LM75 or DS1307 clock; SPI → SPI flash; UART → MIDI or Modbus.
+Pick the annotation row to **show** (data, fields, operations…). It's drawn under the decoder's data line and
+listed in time order with UART, I²C and SPI. Warnings from any decoder in the stack show in red. Long captures and 16
+channels work too. Decoders are remembered and saved in `.mojola` files.
+
+This needs `sigrok-cli`, installed separately. Mojo LA runs it and never bundles it: sigrok is GPL-3, and staying a
+separate program keeps it that way.
+
+```bash
+brew install sigrok-cli          # macOS
+sudo apt install sigrok-cli      # Debian / Ubuntu
+```
+
+On Windows, use the sigrok-cli installer from [sigrok.org](https://sigrok.org/wiki/Downloads). Without it, the
+built-in UART, I²C and SPI decoders still work. Tests: `node viewer/ui/sigrok.test.js` and `cargo test` (a real
+round trip through sigrok-cli when it's installed).
 
 **Keep and share captures.** **Save** (⌘S) writes a `.mojola` file: the samples plus everything needed to
 reopen it exactly as it was, including the sample rate, trigger point, time taken, channel names, UART chips and
